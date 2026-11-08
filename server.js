@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 7860;
 process.on('uncaughtException', (err) => console.error('❌ uncaughtException:', err.message));
 process.on('unhandledRejection', (reason) => console.error('❌ unhandledRejection:', reason));
 
-// Middleware & Volledige CORS
+// Volledige CORS headers (verplicht voor video players)
 app.use(express.json());
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -60,11 +60,24 @@ const safetySettings = [
   { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
 ];
 
+// ExoPlayer-proof WebVTT converter
 function srtToVtt(srtText) {
-  if (!srtText) return 'WEBVTT\n\n';
-  if (srtText.trim().startsWith('WEBVTT')) return srtText;
-  const clean = srtText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  return 'WEBVTT\n\n' + clean.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+  if (!srtText || typeof srtText !== 'string') return 'WEBVTT\n\n1\n00:00:01.000 --> 00:00:04.000\n[Geen ondertitels gevonden]\n\n';
+  
+  let clean = srtText.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  
+  // Verwijder eventuele UTF-8 BOM
+  if (clean.charCodeAt(0) === 0xFEFF) {
+    clean = clean.substring(1);
+  }
+  
+  if (clean.startsWith('WEBVTT')) {
+    return clean;
+  }
+  
+  // Converteer SRT timestamps (00:00:00,000) naar VTT (00:00:00.000)
+  const converted = clean.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+  return `WEBVTT\n\n${converted}\n`;
 }
 
 async function translateFullSrtWithGemini(rawSrt, geminiKey, preferredModel) {
@@ -84,7 +97,7 @@ STRIKTE REGELS:
 1. Behoud exact alle originele nummers en timestamps.
 2. Wijzig de tijdcodes nooit.
 3. Vertaal uitsluitend de dialoogtekst.
-4. Geen introductie of markdown (\`\`\` of \`\`\`srt).
+4. Geen introductie of markdown codeblokken (\`\`\` of \`\`\`srt).
 
 SRT:
 ${rawSrt}`;
@@ -154,14 +167,14 @@ app.post('/api/validate/subsource', async (req, res) => {
 
   try {
     const response = await axios.get('https://api.subsource.net/api/v1/subtitles/recent', {
-      headers: { 'X-API-Key': key, 'User-Agent': 'SubNova/2.0', 'Accept': 'application/json' },
+      headers: { 'X-API-Key': key, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept': 'application/json' },
       params: { api_key: key },
       timeout: 7000
     });
     if (response.status === 200) return res.json({ success: true, message: 'SubSource API is actief!' });
   } catch (err) {
     const status = err.response?.status;
-    if (status === 401 || status === 403) return res.json({ success: false, error: 'Ongeldige SubSource sleutel (401/403)' });
+    if (status === 401 || status === 403) return res.json({ success: false, error: 'Ongeldige SubSource sleutel' });
     return res.json({ success: false, error: 'Verbinding mislukt (' + (status || 'timeout') + ')' });
   }
   return res.json({ success: false, error: 'SubSource gaf geen reactie' });
@@ -227,8 +240,7 @@ async function fetchOpenSubtitlesOfficial(imdbId, season, episode, osApiKey, osU
         fileId: file.file_id,
         lang: (lang === 'nl' || lang === 'dut') ? 'nl' : 'en',
         release: item.attributes?.release || item.attributes?.feature_details?.movie_name || 'OpenSubtitles Match',
-        osApiKey: apiKey.trim(),
-        osToken: token
+        osApiKey: apiKey.trim()
       });
     }
     return results;
@@ -242,7 +254,10 @@ async function fetchOpenSubtitlesPublic(type, id, extra) {
     const url = extra 
       ? `https://opensubtitles-v3.strem.io/subtitles/${type}/${id}/${extra}.json`
       : `https://opensubtitles-v3.strem.io/subtitles/${type}/${id}.json`;
-    const res = await axios.get(url, { timeout: 4000 });
+    const res = await axios.get(url, { 
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+      timeout: 4000 
+    });
     return (res.data?.subtitles || []).map(item => ({
       source: 'OpenSubtitles',
       id: item.id,
@@ -278,7 +293,7 @@ async function fetchSubSource(imdbId, userKey) {
   try {
     const searchRes = await axios.get('https://api.subsource.net/api/v1/movies/search', {
       params: { query: imdbId, api_key: key },
-      headers: { 'X-API-Key': key, 'User-Agent': 'SubNova/2.0' },
+      headers: { 'X-API-Key': key, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
       timeout: 4500
     });
     const movies = searchRes.data?.data || searchRes.data?.movies || (Array.isArray(searchRes.data) ? searchRes.data : []);
@@ -287,7 +302,7 @@ async function fetchSubSource(imdbId, userKey) {
 
     const subRes = await axios.get('https://api.subsource.net/api/v1/subtitles', {
       params: { movieId: movie.id, lang: 'dutch,english', api_key: key },
-      headers: { 'X-API-Key': key, 'User-Agent': 'SubNova/2.0' },
+      headers: { 'X-API-Key': key, 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
       timeout: 4500
     });
     const list = subRes.data?.data || subRes.data?.subtitles || (Array.isArray(subRes.data) ? subRes.data : []);
@@ -302,14 +317,18 @@ async function fetchSubSource(imdbId, userKey) {
   } catch (err) { return []; }
 }
 
+// Download helper met fallback & unzip
 async function downloadSubtitleText(sub) {
+  const browserHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': '*/*'
+  };
+
   if (sub.fileId && sub.osApiKey) {
     const headers = { 'Api-Key': sub.osApiKey, 'User-Agent': 'SubNova-v2.0', 'Content-Type': 'application/json' };
-    if (sub.osToken) headers['Authorization'] = `Bearer ${sub.osToken}`;
-
     const dlRes = await axios.post('https://api.opensubtitles.com/api/v1/download', { file_id: sub.fileId }, { headers, timeout: 8000 });
     if (dlRes.data?.link) {
-      const fileRes = await axios.get(dlRes.data.link, { responseType: 'arraybuffer', timeout: 8000 });
+      const fileRes = await axios.get(dlRes.data.link, { headers: browserHeaders, responseType: 'arraybuffer', timeout: 8000 });
       const buffer = Buffer.from(fileRes.data);
       try {
         const zip = new AdmZip(buffer);
@@ -321,7 +340,7 @@ async function downloadSubtitleText(sub) {
 
   if (sub.downloadUrl && sub.apiKey) {
     const fileRes = await axios.get(sub.downloadUrl, {
-      headers: { 'X-API-Key': sub.apiKey },
+      headers: { ...browserHeaders, 'X-API-Key': sub.apiKey },
       params: { api_key: sub.apiKey },
       responseType: 'arraybuffer',
       timeout: 8000
@@ -335,7 +354,7 @@ async function downloadSubtitleText(sub) {
   }
 
   if (sub.directUrl) {
-    const fileRes = await axios.get(sub.directUrl, { responseType: 'arraybuffer', timeout: 8000 });
+    const fileRes = await axios.get(sub.directUrl, { headers: browserHeaders, responseType: 'arraybuffer', timeout: 8000 });
     const buffer = Buffer.from(fileRes.data);
     try {
       const zip = new AdmZip(buffer);
@@ -394,31 +413,55 @@ app.get([
 
   let subtitles = [];
 
+  // 1. AI Vertaling via Gemini (.vtt extensie toegevoegd voor mediaspelers)
   if (enSubs.length > 0) {
     const bestEn = enSubs[0];
-    const payload = encodeURIComponent(JSON.stringify({
-      ...bestEn,
+    const minimalData = {
+      fileId: bestEn.fileId,
+      osApiKey: bestEn.osApiKey,
+      downloadUrl: bestEn.downloadUrl,
+      apiKey: bestEn.apiKey,
+      directUrl: bestEn.directUrl,
       mediaId: id,
       geminiKey: config.geminiKey,
       geminiModel: config.geminiModel
-    }));
+    };
+    const payload = Buffer.from(JSON.stringify(minimalData)).toString('base64url');
 
     subtitles.push({
       id: `ai_nl_sync_top`,
-      url: `${host}/sub/translate?data=${payload}`,
+      url: `${host}/sub/translate.vtt?d=${payload}`,
       lang: 'dut',
-      label: `⭐ [AI NL • Gesynchroniseerd] Gemini 3.5 (${bestEn.release})`
+      label: `⭐ [AI NL • Gesynchroniseerd] Gemini (${bestEn.release.substring(0, 30)})`
     });
   }
 
+  // 2. Bestaande Nederlandse subs (.vtt extensie toegevoegd voor mediaspelers)
   nlSubs.forEach((sub, idx) => {
-    const payload = encodeURIComponent(JSON.stringify(sub));
-    subtitles.push({
-      id: `nl_${sub.source.replace(/\s+/g, '_')}_${idx}`,
-      url: `${host}/sub/stream?data=${payload}`,
-      lang: 'dut',
-      label: `[${sub.source}] ${sub.release || 'Nederlands'}`
-    });
+    // Als het al een publieke directe WebVTT/SRT link is van strem.io, stuur direct door!
+    if (sub.directUrl && (sub.directUrl.endsWith('.vtt') || sub.directUrl.endsWith('.srt'))) {
+      subtitles.push({
+        id: `nl_${idx}`,
+        url: sub.directUrl,
+        lang: 'dut',
+        label: `[${sub.source}] ${sub.release.substring(0, 35)}`
+      });
+    } else {
+      const minimalData = {
+        fileId: sub.fileId,
+        osApiKey: sub.osApiKey,
+        downloadUrl: sub.downloadUrl,
+        apiKey: sub.apiKey,
+        directUrl: sub.directUrl
+      };
+      const payload = Buffer.from(JSON.stringify(minimalData)).toString('base64url');
+      subtitles.push({
+        id: `nl_${sub.source.replace(/\s+/g, '_')}_${idx}`,
+        url: `${host}/sub/stream.vtt?d=${payload}`,
+        lang: 'dut',
+        label: `[${sub.source}] ${sub.release.substring(0, 35)}`
+      });
+    }
   });
 
   res.setHeader('Cache-Control', 'max-age=3600, stale-while-revalidate=86400');
@@ -426,357 +469,44 @@ app.get([
   res.json({ subtitles });
 });
 
-// ================= STREAM PROXY ================= //
+// ================= STREAM PROXY MET .VTT EXTENSIE ================= //
 
-app.get('/sub/stream', async (req, res) => {
+app.get(['/sub/stream', '/sub/stream.vtt'], async (req, res) => {
   try {
-    const sub = JSON.parse(decodeURIComponent(req.query.data));
+    const rawParam = req.query.d || req.query.data;
+    if (!rawParam) return res.status(400).send('WEBVTT\n\n');
+
+    let sub;
+    try {
+      sub = JSON.parse(Buffer.from(rawParam, 'base64url').toString('utf8'));
+    } catch (e) {
+      sub = JSON.parse(decodeURIComponent(rawParam));
+    }
+
     const rawText = await downloadSubtitleText(sub);
     const vtt = srtToVtt(rawText);
+
     res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.send(vtt);
   } catch (err) {
-    res.status(500).send('Fout bij streamen van ondertitel');
+    res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+    res.send('WEBVTT\n\n1\n00:00:01.000 --> 00:00:04.000\n[Fout bij laden ondertitel]\n\n');
   }
 });
 
-// ================= TRANSLATE ================= //
+// ================= TRANSLATE MET .VTT EXTENSIE ================= //
 
-app.get('/sub/translate', async (req, res) => {
+app.get(['/sub/translate', '/sub/translate.vtt'], async (req, res) => {
   try {
-    const data = JSON.parse(decodeURIComponent(req.query.data));
-    const cacheKey = `ai_nl_synced_${data.mediaId}_${Buffer.from(data.directUrl || data.downloadUrl || data.id).toString('base64').substring(0, 24)}`;
+    const rawParam = req.query.d || req.query.data;
+    if (!rawParam) return res.status(400).send('WEBVTT\n\n');
 
-    if (db) {
-      try {
-        const cached = await db.collection('translations').findOne({ cacheKey });
-        if (cached && cached.vtt) {
-          res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
-          res.setHeader('Access-Control-Allow-Origin', '*');
-          return res.send(cached.vtt);
-        }
-      } catch (e) {}
+    let data;
+    try {
+      data = JSON.parse(Buffer.from(rawParam, 'base64url').toString('utf8'));
+    } catch (e) {
+      data = JSON.parse(decodeURIComponent(rawParam));
     }
 
-    const rawSrt = await downloadSubtitleText(data);
-    if (!rawSrt) throw new Error('Kon Engelse bronsubtitel niet downloaden');
-
-    console.log(`[SubNova] Vertaalopdracht via Gemini voor ${cacheKey}...`);
-    const translatedSrt = await translateFullSrtWithGemini(rawSrt, data.geminiKey, data.geminiModel);
-    const vtt = srtToVtt(translatedSrt);
-
-    if (db) {
-      try {
-        await db.collection('translations').updateOne(
-          { cacheKey },
-          { $set: { cacheKey, vtt, createdAt: new Date() } },
-          { upsert: true }
-        );
-      } catch (e) {}
-    }
-
-    res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.send(vtt);
-  } catch (err) {
-    console.error('Vertaalfout:', err.message);
-    res.status(500).send('Vertaling mislukt');
-  }
-});
-
-// ================= CONFIGURATIE PAGINA ================= //
-
-app.get(['/', '/configure', '/:config/configure'], (req, res) => {
-  const cfg = parseConfig(req.params.config);
-
-  res.send(`<!DOCTYPE html>
-<html lang="nl">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>SubNova AI - Configuratie</title>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg: #090d16;
-      --card: rgba(18, 24, 38, 0.75);
-      --border: rgba(255, 255, 255, 0.08);
-      --primary: #38bdf8;
-      --primary-glow: rgba(56, 189, 248, 0.25);
-      --emerald: #10b981;
-      --emerald-bg: rgba(16, 185, 129, 0.12);
-      --rose: #f43f5e;
-      --rose-bg: rgba(244, 63, 94, 0.12);
-      --text: #f1f5f9;
-      --muted: #94a3b8;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', sans-serif; }
-    body {
-      background-color: var(--bg);
-      background-image: radial-gradient(at 0% 0%, rgba(56, 189, 248, 0.12) 0px, transparent 50%),
-                        radial-gradient(at 100% 100%, rgba(16, 185, 129, 0.08) 0px, transparent 50%);
-      color: var(--text);
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 24px 16px;
-    }
-    .wrapper {
-      width: 100%;
-      max-width: 680px;
-      background: var(--card);
-      backdrop-filter: blur(24px);
-      border: 1px solid var(--border);
-      border-radius: 24px;
-      padding: 36px 32px;
-      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.6);
-    }
-    .header { text-align: center; margin-bottom: 28px; }
-    .badge {
-      display: inline-flex; align-items: center; gap: 6px; background: rgba(56, 189, 248, 0.12);
-      color: var(--primary); border: 1px solid rgba(56, 189, 248, 0.25); padding: 5px 14px;
-      border-radius: 999px; font-size: 0.75rem; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 0.05em; margin-bottom: 12px;
-    }
-    .title { font-size: 2.1rem; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 6px; }
-    .title span { background: linear-gradient(135deg, #38bdf8 0%, #818cf8 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    .subtitle { color: var(--muted); font-size: 0.95rem; }
-    .section-title { font-size: 0.8rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 24px 0 12px; }
-    .field-group { margin-bottom: 18px; }
-    .field-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-    .field-header label { font-size: 0.85rem; font-weight: 600; }
-    .status-badge { font-size: 0.75rem; font-weight: 600; padding: 2px 8px; border-radius: 6px; display: none; align-items: center; gap: 4px; }
-    .status-badge.valid { display: inline-flex; background: var(--emerald-bg); color: var(--emerald); border: 1px solid rgba(16, 185, 129, 0.25); }
-    .status-badge.invalid { display: inline-flex; background: var(--rose-bg); color: var(--rose); border: 1px solid rgba(244, 63, 94, 0.25); }
-    .status-badge.loading { display: inline-flex; background: rgba(255, 255, 255, 0.08); color: var(--muted); }
-    .input-wrapper { position: relative; display: flex; align-items: center; }
-    .input-wrapper input, select {
-      width: 100%; background: rgba(10, 15, 26, 0.8); border: 1px solid var(--border);
-      border-radius: 12px; padding: 12px 105px 12px 14px; color: var(--text); font-size: 0.95rem;
-    }
-    .input-wrapper input:focus, select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-glow); }
-    .input-actions { position: absolute; right: 8px; display: flex; align-items: center; gap: 6px; }
-    .icon-btn { background: transparent; border: none; color: var(--muted); cursor: pointer; padding: 6px; border-radius: 8px; }
-    .check-btn { background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.25); color: var(--primary); font-size: 0.75rem; font-weight: 700; padding: 5px 10px; border-radius: 8px; cursor: pointer; }
-    .check-btn:hover { background: var(--primary); color: #04101e; }
-    .hint { font-size: 0.75rem; color: var(--muted); margin-top: 4px; }
-    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .actions { display: flex; flex-direction: column; gap: 12px; margin-top: 32px; }
-    .btn { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 14px 20px; border-radius: 14px; font-weight: 700; font-size: 0.95rem; cursor: pointer; text-decoration: none; border: none; }
-    .btn-primary { background: linear-gradient(135deg, #38bdf8 0%, #3b82f6 100%); color: #04101e; box-shadow: 0 10px 25px -5px var(--primary-glow); }
-    .btn-secondary { background: rgba(255, 255, 255, 0.05); color: var(--text); border: 1px solid var(--border); }
-  </style>
-</head>
-<body>
-  <div class="wrapper">
-    <div class="header">
-      <div class="badge">⭐ High-Speed Sync & Nuvio Support</div>
-      <h1 class="title">SubNova <span>AI</span></h1>
-      <p class="subtitle">Multi-source Nederlandse ondertitels met Gemini vertaling</p>
-    </div>
-
-    <!-- 1. Gemini AI -->
-    <div class="section-title">1. AI Vertaalmotor (Google Gemini)</div>
-    <div class="field-group">
-      <div class="field-header">
-        <label for="geminiKey">Gemini API Key</label>
-        <span id="geminiBadge" class="status-badge"></span>
-      </div>
-      <div class="input-wrapper">
-        <input type="password" id="geminiKey" placeholder="AIzaSy..." value="${cfg.geminiKey || ''}">
-        <div class="input-actions">
-          <button class="icon-btn" onclick="toggleVisibility('geminiKey')">👁</button>
-          <button class="check-btn" onclick="checkGemini()">Controleer</button>
-        </div>
-      </div>
-      <div class="hint">Gratis via <a href="https://aistudio.google.com" target="_blank" style="color:var(--primary);">aistudio.google.com</a>.</div>
-    </div>
-
-    <div class="field-group">
-      <label style="font-size:0.85rem; font-weight:600; margin-bottom:6px; display:block;">Model</label>
-      <select id="geminiModel">
-        <option value="gemini-3.5-flash-lite" ${cfg.geminiModel === 'gemini-3.5-flash-lite' ? 'selected' : ''}>gemini-3.5-flash-lite (Snelste: 3s vertaaltijd)</option>
-        <option value="gemini-2.5-flash" ${cfg.geminiModel === 'gemini-2.5-flash' ? 'selected' : ''}>gemini-2.5-flash</option>
-      </select>
-    </div>
-
-    <!-- 2. OpenSubtitles -->
-    <div class="section-title">2. OpenSubtitles.com (REST API v1)</div>
-    <div class="field-group">
-      <div class="field-header">
-        <label for="osApiKey">OpenSubtitles API Key</label>
-        <span id="osBadge" class="status-badge"></span>
-      </div>
-      <div class="input-wrapper">
-        <input type="password" id="osApiKey" placeholder="Jouw OpenSubtitles API Key" value="${cfg.osApiKey || ''}">
-        <div class="input-actions">
-          <button class="icon-btn" onclick="toggleVisibility('osApiKey')">👁</button>
-          <button class="check-btn" onclick="checkOpenSubtitles()">Controleer</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="grid-2">
-      <div class="field-group">
-        <label style="font-size:0.85rem; font-weight:600; margin-bottom:6px; display:block;">Gebruikersnaam</label>
-        <div class="input-wrapper">
-          <input type="text" id="osUsername" style="padding-right: 14px;" placeholder="Username" value="${cfg.osUsername || ''}">
-        </div>
-      </div>
-      <div class="field-group">
-        <label style="font-size:0.85rem; font-weight:600; margin-bottom:6px; display:block;">Wachtwoord</label>
-        <div class="input-wrapper">
-          <input type="password" id="osPassword" placeholder="Password" value="${cfg.osPassword || ''}">
-          <div class="input-actions">
-            <button class="icon-btn" onclick="toggleVisibility('osPassword')">👁</button>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- 3. SubSource & SubDL -->
-    <div class="section-title">3. SubSource & SubDL (Optioneel)</div>
-    <div class="field-group">
-      <div class="field-header">
-        <label for="subsourceKey">SubSource API Key</label>
-        <span id="subsourceBadge" class="status-badge"></span>
-      </div>
-      <div class="input-wrapper">
-        <input type="password" id="subsourceKey" placeholder="SubSource API key" value="${cfg.subsourceKey || ''}">
-        <div class="input-actions">
-          <button class="icon-btn" onclick="toggleVisibility('subsourceKey')">👁</button>
-          <button class="check-btn" onclick="checkSubSource()">Controleer</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="field-group">
-      <div class="field-header">
-        <label for="subdlKey">SubDL API Key</label>
-        <span id="subdlBadge" class="status-badge"></span>
-      </div>
-      <div class="input-wrapper">
-        <input type="password" id="subdlKey" placeholder="SubDL API key" value="${cfg.subdlKey || ''}">
-        <div class="input-actions">
-          <button class="icon-btn" onclick="toggleVisibility('subdlKey')">👁</button>
-          <button class="check-btn" onclick="checkSubDL()">Controleer</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- Acties -->
-    <div class="actions">
-      <button class="btn btn-primary" onclick="installAddon()">Installeer in Stremio / Nuvio</button>
-      <button class="btn btn-secondary" onclick="copyManifestUrl()">Kopieer Add-on Manifest Link</button>
-    </div>
-  </div>
-
-  <script>
-    function toggleVisibility(id) {
-      const el = document.getElementById(id);
-      el.type = el.type === 'password' ? 'text' : 'password';
-    }
-
-    function setBadge(id, state, text) {
-      const el = document.getElementById(id);
-      el.className = 'status-badge ' + state;
-      el.textContent = text;
-    }
-
-    async function checkGemini() {
-      const apiKey = document.getElementById('geminiKey').value.trim();
-      const model = document.getElementById('geminiModel').value;
-      if (!apiKey) return alert('Vul eerst een Gemini API-sleutel in.');
-      setBadge('geminiBadge', 'loading', '⏳ Verifiëren...');
-      try {
-        const res = await fetch('/api/validate/gemini', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ apiKey, model })
-        });
-        const data = await res.json();
-        setBadge('geminiBadge', data.success ? 'valid' : 'invalid', data.success ? '✓ Actief' : '✕ Ongeldig');
-      } catch (e) { setBadge('geminiBadge', 'invalid', '✕ Fout'); }
-    }
-
-    async function checkOpenSubtitles() {
-      const apiKey = document.getElementById('osApiKey').value.trim();
-      const username = document.getElementById('osUsername').value.trim();
-      const password = document.getElementById('osPassword').value.trim();
-      if (!apiKey) return alert('Vul eerst een OpenSubtitles API Key in.');
-      setBadge('osBadge', 'loading', '⏳ Verifiëren...');
-      try {
-        const res = await fetch('/api/validate/opensubtitles', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ apiKey, username, password })
-        });
-        const data = await res.json();
-        setBadge('osBadge', data.success ? 'valid' : 'invalid', data.success ? ('✓ ' + data.message) : '✕ Mislukt');
-      } catch (e) { setBadge('osBadge', 'invalid', '✕ Fout'); }
-    }
-
-    async function checkSubDL() {
-      const apiKey = document.getElementById('subdlKey').value.trim();
-      if (!apiKey) return alert('Vul een SubDL API-sleutel in.');
-      setBadge('subdlBadge', 'loading', '⏳ Controleren...');
-      try {
-        const res = await fetch('/api/validate/subdl', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ apiKey })
-        });
-        const data = await res.json();
-        setBadge('subdlBadge', data.success ? 'valid' : 'invalid', data.success ? '✓ Actief' : '✕ Ongeldig');
-      } catch (e) { setBadge('subdlBadge', 'invalid', '✕ Fout'); }
-    }
-
-    async function checkSubSource() {
-      const apiKey = document.getElementById('subsourceKey').value.trim();
-      if (!apiKey) return alert('Vul een SubSource API-sleutel in.');
-      setBadge('subsourceBadge', 'loading', '⏳ Controleren...');
-      try {
-        const res = await fetch('/api/validate/subsource', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ apiKey })
-        });
-        const data = await res.json();
-        setBadge('subsourceBadge', data.success ? 'valid' : 'invalid', data.success ? '✓ Actief' : '✕ Ongeldig');
-      } catch (e) { setBadge('subsourceBadge', 'invalid', '✕ Fout'); }
-    }
-
-    function generateManifestUrl() {
-      const config = {
-        enableAi: true,
-        geminiKey: document.getElementById('geminiKey').value.trim(),
-        geminiModel: document.getElementById('geminiModel').value,
-        osApiKey: document.getElementById('osApiKey').value.trim(),
-        osUsername: document.getElementById('osUsername').value.trim(),
-        osPassword: document.getElementById('osPassword').value.trim(),
-        subsourceKey: document.getElementById('subsourceKey').value.trim(),
-        subdlKey: document.getElementById('subdlKey').value.trim(),
-      };
-      const encoded = btoa(JSON.stringify(config)).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
-      return window.location.origin + '/' + encoded + '/manifest.json';
-    }
-
-    function installAddon() {
-      const url = generateManifestUrl();
-      window.location.href = url.replace(/^https?:\\/\\//, 'stremio://');
-    }
-
-    function copyManifestUrl() {
-      navigator.clipboard.writeText(generateManifestUrl()).then(() => alert('Manifest link gekopieerd!'));
-    }
-  </script>
-</body>
-</html>`);
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 SubNova AI met OpenSubtitles draait op poort ${PORT}`);
-});
-
+    const cacheKey = `ai_nl_${data.mediaId}_${Buffer.from(data.directUrl || data.downloadUrl || String(data.fileId || '')).toString('ba
