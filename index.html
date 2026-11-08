@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SubNova – AI Nederlandse ondertitels</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --text:#1c1f24; --muted:#6a7280; --line:#d9dde3; --accent:#6c5ce7; --ok:#1a9d5b; --err:#d63c3c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#181b21; --text:#eceff4; --muted:#9aa3b2; --line:#2a2f38; --accent:#8b7dff; --ok:#38c987; --err:#ff6b6b; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); padding:16px; }
+  .wrap { max-width:560px; margin:0 auto; }
+  h1 { font-size:1.4rem; margin:8px 0 4px; }
+  .sub { color:var(--muted); font-size:.9rem; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
+  .card h2 { font-size:1rem; margin:0 0 10px; }
+  label { display:block; font-size:.8rem; color:var(--muted); margin:10px 0 4px; }
+  input { width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:transparent; color:var(--text); font-size:.95rem; }
+  button { padding:10px 14px; border-radius:8px; border:0; background:var(--accent); color:#fff; font-size:.95rem; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  .row { display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap; }
+  .status { font-size:.85rem; }
+  .ok { color:var(--ok); } .err { color:var(--err); }
+  #out { word-break:break-all; font-size:.8rem; color:var(--muted); margin-top:10px; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>SubNova</h1>
+  <div class="sub">Nederlandse ondertitels, met AI-vertaling als er geen NL beschikbaar is.</div>
+
+  <div class="card">
+    <h2>Gemini (AI vertaling)</h2>
+    <label>API key</label>
+    <input id="geminiKey" type="password" autocomplete="off">
+    <label>Model (optioneel)</label>
+    <input id="geminiModel" placeholder="gemini-2.5-flash">
+    <div class="row"><button class="ghost" onclick="validate('gemini')">Test</button><span id="s-gemini" class="status"></span></div>
+  </div>
+
+  <div class="card">
+    <h2>OpenSubtitles</h2>
+    <label>API key</label>
+    <input id="osApiKey" type="password" autocomplete="off">
+    <label>Gebruikersnaam (optioneel)</label>
+    <input id="osUsername" autocomplete="off">
+    <label>Wachtwoord (optioneel)</label>
+    <input id="osPassword" type="password" autocomplete="off">
+    <div class="row"><button class="ghost" onclick="validate('opensubtitles')">Test</button><span id="s-opensubtitles" class="status"></span></div>
+  </div>
+
+  <div class="card">
+    <h2>SubDL</h2>
+    <label>API key</label>
+    <input id="subdlKey" type="password" autocomplete="off">
+    <div class="row"><button class="ghost" onclick="validate('subdl')">Test</button><span id="s-subdl" class="status"></span></div>
+  </div>
+
+  <div class="card">
+    <h2>SubSource</h2>
+    <label>API key</label>
+    <input id="subsourceKey" type="password" autocomplete="off">
+    <div class="row"><button class="ghost" onclick="validate('subsource')">Test</button><span id="s-subsource" class="status"></span></div>
+  </div>
+
+  <div class="card">
+    <h2>Installeren</h2>
+    <div class="row">
+      <button onclick="installStremio()">Installeer in Stremio</button>
+      <button class="ghost" onclick="copyUrl()">Kopieer manifest-URL</button>
+    </div>
+    <div class="status" id="s-install"></div>
+    <div id="out"></div>
+  </div>
+</div>
+
+<script>
+const FIELDS = ['geminiKey','geminiModel','osApiKey','osUsername','osPassword','subdlKey','subsourceKey'];
+const val = (id) => document.getElementById(id).value.trim();
+
+function buildConfig() {
+  const cfg = {};
+  FIELDS.forEach((f) => { if (val(f)) cfg[f] = val(f); });
+  return cfg;
+}
+
+function encodeConfig(cfg) {
+  const json = JSON.stringify(cfg);
+  const b64 = btoa(unescape(encodeURIComponent(json)));
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function manifestUrl() {
+  const cfg = buildConfig();
+  const base = location.origin;
+  return Object.keys(cfg).length
+    ? `${base}/${encodeConfig(cfg)}/manifest.json`
+    : `${base}/manifest.json`;
+}
+
+async function validate(kind) {
+  const el = document.getElementById('s-' + kind);
+  el.className = 'status'; el.textContent = 'Bezig...';
+  const body = {
+    gemini: { apiKey: val('geminiKey'), model: val('geminiModel') },
+    opensubtitles: { apiKey: val('osApiKey'), username: val('osUsername'), password: val('osPassword') },
+    subdl: { apiKey: val('subdlKey') },
+    subsource: { apiKey: val('subsourceKey') }
+  }[kind];
+  try {
+    const r = await fetch('/api/validate/' + kind, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const d = await r.json();
+    el.className = 'status ' + (d.success ? 'ok' : 'err');
+    el.textContent = d.success ? '✓ ' + d.message : '✗ ' + d.error;
+  } catch (e) {
+    el.className = 'status err';
+    el.textContent = '✗ Server niet bereikbaar';
+  }
+}
+
+function installStremio() {
+  const url = manifestUrl();
+  document.getElementById('out').textContent = url;
+  location.href = url.replace(/^https?:\/\//, 'stremio://');
+}
+
+async function copyUrl() {
+  const url = manifestUrl();
+  document.getElementById('out').textContent = url;
+  const s = document.getElementById('s-install');
+  try {
+    await navigator.clipboard.writeText(url);
+    s.className = 'status ok'; s.textContent = '✓ Gekopieerd. Plak in Stremio of Nuvio.';
+  } catch (e) {
+    s.className = 'status'; s.textContent = 'Kopieer de URL hieronder handmatig.';
+  }
+}
+</script>
+</body>
+</html>
