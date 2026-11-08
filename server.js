@@ -527,6 +527,16 @@ function sendVtt(res, body, cache) {
 const message = (text) =>
   `WEBVTT\n\n00:00:01.000 --> 00:00:10.000\n${text}\n\n`;
 
+// ---------- Configuration page ----------
+const path = require('path');
+
+app.get(['/', '/configure', '/:config/configure'], (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+app.get('/style.css', (req, res) => {
+  res.sendFile(path.join(__dirname, 'style.css'));
+});
+
 // ================= STREMIO ROUTES ================= //
 
 app.get(['/manifest.json', '/:config/manifest.json'], (req, res) => {
