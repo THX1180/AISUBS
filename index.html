@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AISUBS — AI Subtitle Translator & Sync</title>
+  <title>AISUBS — AI Subtitle Translation & Sync</title>
   <link rel="stylesheet" href="style.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -15,26 +15,28 @@
 
   <main class="container">
     <header class="header">
-      <div class="badge">v1.2.0 • Ultra Fast & Sync</div>
+      <div class="badge">v1.3.0 • Verified Subtitle Providers</div>
       <h1>AISUBS</h1>
-      <p class="subtitle">AI-powered on-demand subtitle translation and audio sync for Stremio & Nuvio.</p>
+      <p class="subtitle">Translate and sync subtitles on-demand using OpenSubtitles, SubDL, SubSource & AI.</p>
     </header>
 
     <div class="glass-card">
       <form id="configForm">
-        <!-- Target Language -->
+
+        <!-- 1. Target Language -->
+        <div class="section-title">1. Target Language</div>
         <div class="form-group">
-          <label for="langSelect">Target Language</label>
+          <label for="langSelect">Language in Stremio/Nuvio Subtitle Menu</label>
           <div class="select-wrapper">
             <select id="langSelect">
               <option value="spa|Spanish|🇪🇸">🇪🇸 Spanish (Español)</option>
+              <option value="nld|Dutch|🇳🇱">🇳🇱 Dutch (Nederlands)</option>
               <option value="fre|French|🇫🇷">🇫🇷 French (Français)</option>
               <option value="ger|German|🇩🇪">🇩🇪 German (Deutsch)</option>
               <option value="ita|Italian|🇮🇹">🇮🇹 Italian (Italiano)</option>
               <option value="por|Portuguese|🇧🇷">🇧🇷 Portuguese (Português)</option>
               <option value="rus|Russian|🇷🇺">🇷🇺 Russian (Русский)</option>
               <option value="ara|Arabic|🇸🇦">🇸🇦 Arabic (العربية)</option>
-              <option value="nld|Dutch|🇳🇱">🇳🇱 Dutch (Nederlands)</option>
               <option value="tur|Turkish|🇹🇷">🇹🇷 Turkish (Türkçe)</option>
               <option value="pol|Polish|🇵🇱">🇵🇱 Polish (Polski)</option>
               <option value="jpn|Japanese|🇯🇵">🇯🇵 Japanese (日本語)</option>
@@ -49,40 +51,113 @@
           </div>
         </div>
 
-        <!-- AI Provider -->
+        <!-- 2. Subtitle Source Providers -->
+        <div class="section-title">2. Subtitle Sources (Optional Credentials)</div>
+        <p class="section-desc">If left blank, the addon automatically falls back to the public OpenSubtitles service.</p>
+
+        <!-- OpenSubtitles -->
+        <div class="credential-box">
+          <div class="box-header">
+            <span>🎬 OpenSubtitles.com</span>
+            <span id="osBadge" class="status-indicator"></span>
+          </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <div class="input-with-eye">
+              <input type="password" id="osApiKey" placeholder="OpenSubtitles API Key">
+              <button type="button" class="eye-btn" data-target="osApiKey">👁️</button>
+            </div>
+          </div>
+          <div class="grid-2">
+            <div class="form-group">
+              <label>Username</label>
+              <input type="text" id="osUsername" placeholder="Optional VIP user">
+            </div>
+            <div class="form-group">
+              <label>Password</label>
+              <div class="input-with-eye">
+                <input type="password" id="osPassword" placeholder="Optional password">
+                <button type="button" class="eye-btn" data-target="osPassword">👁️</button>
+              </div>
+            </div>
+          </div>
+          <button type="button" id="verifyOsBtn" class="btn btn-sm">Verify OpenSubtitles</button>
+        </div>
+
+        <!-- SubDL -->
+        <div class="credential-box">
+          <div class="box-header">
+            <span>⚡ SubDL</span>
+            <span id="subdlBadge" class="status-indicator"></span>
+          </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <div class="input-with-eye">
+              <input type="password" id="subdlApiKey" placeholder="SubDL API Key">
+              <button type="button" class="eye-btn" data-target="subdlApiKey">👁️</button>
+            </div>
+          </div>
+          <button type="button" id="verifySubdlBtn" class="btn btn-sm">Verify SubDL</button>
+        </div>
+
+        <!-- SubSource -->
+        <div class="credential-box">
+          <div class="box-header">
+            <span>🎯 SubSource</span>
+            <span id="subsourceBadge" class="status-indicator"></span>
+          </div>
+          <div class="form-group">
+            <label>API Key</label>
+            <div class="input-with-eye">
+              <input type="password" id="subsourceApiKey" placeholder="SubSource API Key">
+              <button type="button" class="eye-btn" data-target="subsourceApiKey">👁️</button>
+            </div>
+          </div>
+          <button type="button" id="verifySubsourceBtn" class="btn btn-sm">Verify SubSource</button>
+        </div>
+
+        <!-- 3. AI Translation Engine -->
+        <div class="section-title">3. AI Translation Engine</div>
         <div class="form-group">
-          <label for="providerSelect">Translation Engine</label>
+          <label for="providerSelect">Provider</label>
           <div class="select-wrapper">
             <select id="providerSelect">
               <option value="free">⚡ Free Web Engine (No API Key Required)</option>
-              <option value="gemini">✨ Google Gemini (Recommended - Free & Fast)</option>
+              <option value="gemini">✨ Google Gemini (Fast & Free Key Available)</option>
               <option value="groq">⚡ Groq (Ultra-Fast Llama 3.3)</option>
-              <option value="openrouter">🌐 OpenRouter (Claude, DeepSeek, etc.)</option>
+              <option value="openrouter">🌐 OpenRouter (DeepSeek, Claude, etc.)</option>
               <option value="openai">🤖 OpenAI (GPT-4o mini)</option>
               <option value="deepseek">🧠 DeepSeek API</option>
             </select>
           </div>
         </div>
 
-        <!-- API Key & Model (Conditional) -->
-        <div id="aiCredentials" class="hidden-field">
-          <div class="form-group">
-            <label for="apiKey">API Key</label>
-            <input type="password" id="apiKey" placeholder="Paste your API key here">
+        <div id="aiCredentials" class="hidden-field credential-box">
+          <div class="box-header">
+            <span>AI Credentials</span>
+            <span id="aiBadge" class="status-indicator"></span>
           </div>
-
           <div class="form-group">
-            <label for="modelInput">Model Name (Optional)</label>
+            <label for="apiKey">AI API Key</label>
+            <div class="input-with-eye">
+              <input type="password" id="apiKey" placeholder="Paste your AI key">
+              <button type="button" class="eye-btn" data-target="apiKey">👁️</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="modelInput">Model (Optional)</label>
             <input type="text" id="modelInput" placeholder="default (e.g. gemini-2.0-flash)">
           </div>
+          <button type="button" id="verifyAiBtn" class="btn btn-sm">Verify AI Key</button>
         </div>
 
-        <!-- Sync Offset & Bilingual -->
+        <!-- 4. Sync & Bilingual Settings -->
+        <div class="section-title">4. Sync & Style</div>
         <div class="grid-2">
           <div class="form-group">
             <label for="offsetMs">Sync Offset (ms)</label>
             <input type="number" id="offsetMs" value="0" step="100" placeholder="0">
-            <span class="helper">Negative = earlier, Positive = delay</span>
+            <span class="helper">-1000 = 1s earlier, +1000 = 1s delay</span>
           </div>
 
           <div class="form-group checkbox-group">
@@ -92,12 +167,12 @@
             </label>
             <div class="switch-meta">
               <span class="switch-title">Dual Subtitles</span>
-              <span class="helper">Shows original + translated lines</span>
+              <span class="helper">Original + Translated</span>
             </div>
           </div>
         </div>
 
-        <!-- Actions -->
+        <!-- Action Buttons -->
         <div class="actions">
           <button type="button" id="installBtn" class="btn btn-primary">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -121,8 +196,8 @@
     <!-- QR Code Modal -->
     <div id="qrModal" class="modal hidden">
       <div class="modal-card">
-        <h3>Scan with Nuvio or Phone</h3>
-        <p class="helper">Scan with your TV app camera or phone to install.</p>
+        <h3>Scan to Install on TV</h3>
+        <p class="helper">Scan using Nuvio or your mobile camera.</p>
         <div id="qrCodeContainer"></div>
         <button id="closeModalBtn" class="btn btn-secondary" style="margin-top: 1rem;">Close</button>
       </div>
@@ -131,6 +206,20 @@
 
   <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
   <script>
+    // Eye toggles for passwords
+    document.querySelectorAll('.eye-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const input = document.getElementById(btn.getAttribute('data-target'));
+        if (input.type === 'password') {
+          input.type = 'text';
+          btn.textContent = '🔒';
+        } else {
+          input.type = 'password';
+          btn.textContent = '👁️';
+        }
+      });
+    });
+
     const providerSelect = document.getElementById('providerSelect');
     const aiCredentials = document.getElementById('aiCredentials');
     const langSelect = document.getElementById('langSelect');
@@ -138,12 +227,12 @@
     const modelInput = document.getElementById('modelInput');
     const offsetMs = document.getElementById('offsetMs');
     const bilingual = document.getElementById('bilingual');
-    const installBtn = document.getElementById('installBtn');
-    const copyBtn = document.getElementById('copyBtn');
-    const qrBtn = document.getElementById('qrBtn');
-    const qrModal = document.getElementById('qrModal');
-    const closeModalBtn = document.getElementById('closeModalBtn');
-    const statusToast = document.getElementById('statusToast');
+
+    const osApiKey = document.getElementById('osApiKey');
+    const osUsername = document.getElementById('osUsername');
+    const osPassword = document.getElementById('osPassword');
+    const subdlApiKey = document.getElementById('subdlApiKey');
+    const subsourceApiKey = document.getElementById('subsourceApiKey');
 
     function toggleCredentials() {
       if (providerSelect.value === 'free') {
@@ -155,6 +244,73 @@
     providerSelect.addEventListener('change', toggleCredentials);
     toggleCredentials();
 
+    // Verification helpers
+    async function verifyService(url, body, badgeEl, btnEl) {
+      const origText = btnEl.textContent;
+      btnEl.textContent = 'Checking...';
+      btnEl.disabled = true;
+      badgeEl.className = 'status-indicator loading';
+      badgeEl.textContent = '⏳';
+
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        if (res.ok && data.valid) {
+          badgeEl.className = 'status-indicator success';
+          badgeEl.textContent = '✓ Verified';
+        } else {
+          badgeEl.className = 'status-indicator error';
+          badgeEl.textContent = `✗ ${data.error || 'Failed'}`;
+        }
+      } catch (e) {
+        badgeEl.className = 'status-indicator error';
+        badgeEl.textContent = '✗ Connection Error';
+      } finally {
+        btnEl.textContent = origText;
+        btnEl.disabled = false;
+      }
+    }
+
+    document.getElementById('verifyOsBtn').addEventListener('click', () => {
+      verifyService(
+        '/api/verify-opensubtitles',
+        { apiKey: osApiKey.value.trim(), username: osUsername.value.trim(), password: osPassword.value.trim() },
+        document.getElementById('osBadge'),
+        document.getElementById('verifyOsBtn')
+      );
+    });
+
+    document.getElementById('verifySubdlBtn').addEventListener('click', () => {
+      verifyService(
+        '/api/verify-subdl',
+        { apiKey: subdlApiKey.value.trim() },
+        document.getElementById('subdlBadge'),
+        document.getElementById('verifySubdlBtn')
+      );
+    });
+
+    document.getElementById('verifySubsourceBtn').addEventListener('click', () => {
+      verifyService(
+        '/api/verify-subsource',
+        { apiKey: subsourceApiKey.value.trim() },
+        document.getElementById('subsourceBadge'),
+        document.getElementById('verifySubsourceBtn')
+      );
+    });
+
+    document.getElementById('verifyAiBtn').addEventListener('click', () => {
+      verifyService(
+        '/api/verify-ai',
+        { provider: providerSelect.value, apiKey: apiKey.value.trim(), model: modelInput.value.trim() },
+        document.getElementById('aiBadge'),
+        document.getElementById('verifyAiBtn')
+      );
+    });
+
     function buildManifestUrl() {
       const [langCode, langName] = langSelect.value.split('|');
       const config = {
@@ -164,7 +320,12 @@
         apiKey: apiKey.value.trim(),
         model: modelInput.value.trim() || 'default',
         offsetMs: parseInt(offsetMs.value, 10) || 0,
-        bilingual: bilingual.checked
+        bilingual: bilingual.checked,
+        osApiKey: osApiKey.value.trim(),
+        osUsername: osUsername.value.trim(),
+        osPassword: osPassword.value.trim(),
+        subdlApiKey: subdlApiKey.value.trim(),
+        subsourceApiKey: subsourceApiKey.value.trim()
       };
 
       const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(config))))
@@ -172,38 +333,38 @@
         .replace(/\//g, '_')
         .replace(/=+$/, '');
 
-      const origin = window.location.origin;
-      return `${origin}/${b64}/manifest.json`;
+      return `${window.location.origin}/${b64}/manifest.json`;
     }
 
     function showToast(msg) {
-      statusToast.textContent = msg;
-      statusToast.classList.remove('hidden');
-      setTimeout(() => statusToast.classList.add('hidden'), 3500);
+      const toast = document.getElementById('statusToast');
+      toast.textContent = msg;
+      toast.classList.remove('hidden');
+      setTimeout(() => toast.classList.add('hidden'), 3500);
     }
 
-    installBtn.addEventListener('click', () => {
-      const manifestUrl = buildManifestUrl();
-      const stremioProtocol = manifestUrl.replace(/^https?:\/\//, 'stremio://');
-      window.location.href = stremioProtocol;
+    document.getElementById('installBtn').addEventListener('click', () => {
+      const url = buildManifestUrl();
+      window.location.href = url.replace(/^https?:\/\//, 'stremio://');
     });
 
-    copyBtn.addEventListener('click', async () => {
-      const manifestUrl = buildManifestUrl();
+    document.getElementById('copyBtn').addEventListener('click', async () => {
+      const url = buildManifestUrl();
       try {
-        await navigator.clipboard.writeText(manifestUrl);
+        await navigator.clipboard.writeText(url);
         showToast('✓ Addon URL copied! Paste into Nuvio or Stremio.');
       } catch {
-        prompt('Copy your addon URL:', manifestUrl);
+        prompt('Copy your addon URL:', url);
       }
     });
 
-    qrBtn.addEventListener('click', () => {
-      const manifestUrl = buildManifestUrl();
+    const qrModal = document.getElementById('qrModal');
+    document.getElementById('qrBtn').addEventListener('click', () => {
+      const url = buildManifestUrl();
       const container = document.getElementById('qrCodeContainer');
       container.innerHTML = '';
       new QRCode(container, {
-        text: manifestUrl,
+        text: url,
         width: 190,
         height: 190,
         colorDark: "#ffffff",
@@ -213,7 +374,7 @@
       qrModal.classList.remove('hidden');
     });
 
-    closeModalBtn.addEventListener('click', () => qrModal.classList.add('hidden'));
+    document.getElementById('closeModalBtn').addEventListener('click', () => qrModal.classList.add('hidden'));
     qrModal.addEventListener('click', (e) => {
       if (e.target === qrModal) qrModal.classList.add('hidden');
     });
