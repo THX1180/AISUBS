@@ -87,6 +87,21 @@ function parseConfig(raw) {
   }
 }
 
+// Safe URL Encoding / Decoding helpers to prevent signature corruption
+function encodeSourceParam(url) {
+  if (!url) return '';
+  return Buffer.from(url, 'utf-8').toString('base64url');
+}
+
+function decodeSourceParam(param) {
+  if (!param) return '';
+  try {
+    const decoded = Buffer.from(param, 'base64url').toString('utf-8');
+    if (decoded.startsWith('http')) return decoded;
+  } catch {}
+  return param;
+}
+
 // ----------------------------------------------------
 // Profile Storage Endpoints
 // ----------------------------------------------------
@@ -126,7 +141,7 @@ app.post('/api/verify-opensubtitles', async (req, res) => {
     const testRes = await fetch('https://api.opensubtitles.com/api/v1/subtitles?imdb_id=0111161&languages=en', {
       headers: {
         'Api-Key': apiKey,
-        'User-Agent': 'AISUBS v2.1.0',
+        'User-Agent': 'AISUBS v2.2.0',
         'Accept': 'application/json'
       },
       signal: AbortSignal.timeout(7000)
@@ -141,7 +156,7 @@ app.post('/api/verify-opensubtitles', async (req, res) => {
         method: 'POST',
         headers: {
           'Api-Key': apiKey,
-          'User-Agent': 'AISUBS v2.1.0',
+          'User-Agent': 'AISUBS v2.2.0',
           'Content-Type': 'application/json',
           'Accept': 'application/json'
         },
@@ -176,7 +191,6 @@ app.post('/api/verify-subdl', async (req, res) => {
   }
 });
 
-// Fixed SubSource verification endpoint with correct headers and fallback query
 app.post('/api/verify-subsource', async (req, res) => {
   const { apiKey } = req.body;
   if (!apiKey) return res.status(400).json({ valid: false, error: 'API Key is required' });
@@ -188,22 +202,19 @@ app.post('/api/verify-subsource', async (req, res) => {
   };
 
   try {
-    // 1. Test against /subtitles/recent
     const resp = await fetch('https://api.subsource.net/api/v1/subtitles/recent', {
       headers,
       signal: AbortSignal.timeout(7000)
     });
     if (resp.ok) return res.json({ valid: true });
 
-    // 2. Fallback test against /movies/search?searchType=text&q=Inception
     const searchResp = await fetch('https://api.subsource.net/api/v1/movies/search?searchType=text&q=Inception', {
       headers,
       signal: AbortSignal.timeout(7000)
     });
     if (searchResp.ok) return res.json({ valid: true });
 
-    const status = resp.status !== 404 ? resp.status : searchResp.status;
-    return res.status(400).json({ valid: false, error: `Verification failed (HTTP ${status})` });
+    return res.status(400).json({ valid: false, error: `Verification failed (HTTP ${resp.status})` });
   } catch (err) {
     return res.status(500).json({ valid: false, error: err.message });
   }
@@ -244,7 +255,7 @@ app.post('/api/verify-ai', async (req, res) => {
 });
 
 // ----------------------------------------------------
-// Subtitle Discovery & Auto-Sync Engine
+// Subtitle Discovery & Candidate Assembly
 // ----------------------------------------------------
 app.use(async (req, res, next) => {
   if (!req.path.includes('/subtitles/')) return next();
@@ -268,7 +279,7 @@ app.use(async (req, res, next) => {
     });
   }
 
-  const { videoHash, videoSize, filename } = extraParams;
+  const { videoHash, filename } = extraParams;
   const parts = fullId.split(':');
   const imdbId = parts[0];
   const season = parts[1] || null;
@@ -292,7 +303,7 @@ app.use(async (req, res, next) => {
       const osRes = await fetch(osUrl, {
         headers: {
           'Api-Key': config.osApiKey,
-          'User-Agent': 'AISUBS v2.1.0',
+          'User-Agent': 'AISUBS v2.2.0',
           'Accept': 'application/json'
         },
         signal: AbortSignal.timeout(3500)
@@ -325,42 +336,43 @@ app.use(async (req, res, next) => {
     }
   }
 
-  // 2. OpenSubtitles v3 Public Proxy (Forwards exact hash & extra)
-  if (referenceEnSubs.length === 0) {
-    try {
-      let pubUrl = `https://opensubtitles-v3.strem.io/subtitles/${mediaType}/${fullId}`;
-      if (extraStr) pubUrl += `/${extraStr}`;
-      pubUrl += '.json';
+  // 2. OpenSubtitles v3 Public Proxy (With official client User-Agent)
+  try {
+    let pubUrl = `https://opensubtitles-v3.strem.io/subtitles/${mediaType}/${fullId}`;
+    if (extraStr) pubUrl += `/${extraStr}`;
+    pubUrl += '.json';
 
-      const pubRes = await fetch(pubUrl, {
-        headers: { 'User-Agent': 'AISubs/2.1.0' },
-        signal: AbortSignal.timeout(3500)
-      });
+    const pubRes = await fetch(pubUrl, {
+      headers: {
+        'User-Agent': 'Stremio/4.4.168',
+        'Accept': 'application/json'
+      },
+      signal: AbortSignal.timeout(3500)
+    });
 
-      if (pubRes.ok) {
-        const pubData = await pubRes.json();
-        if (Array.isArray(pubData.subtitles)) {
-          pubData.subtitles.forEach(s => {
-            const isTarget = s.lang === targetIso3 || s.lang === targetIso1 || (targetIso3 === 'nld' && s.lang === 'dut');
-            const isEnglish = s.lang === 'eng' || s.lang === 'en';
+    if (pubRes.ok) {
+      const pubData = await pubRes.json();
+      if (Array.isArray(pubData.subtitles)) {
+        pubData.subtitles.forEach(s => {
+          const isTarget = s.lang === targetIso3 || s.lang === targetIso1 || (targetIso3 === 'nld' && s.lang === 'dut');
+          const isEnglish = s.lang === 'eng' || s.lang === 'en';
 
-            const subObj = {
-              source: 'OpenSubtitles-v3',
-              release: filename || 'Synced Video File',
-              isHashMatch: !!videoHash,
-              url: s.url
-            };
-            if (isTarget) nativeTargetSubs.push(subObj);
-            else if (isEnglish) referenceEnSubs.push(subObj);
-          });
-        }
+          const subObj = {
+            source: 'OpenSubtitles-v3',
+            release: filename || 'Synced Video File',
+            isHashMatch: !!videoHash,
+            url: s.url
+          };
+          if (isTarget) nativeTargetSubs.push(subObj);
+          else if (isEnglish) referenceEnSubs.push(subObj);
+        });
       }
-    } catch (e) {
-      console.warn('[AISUBS] OpenSubtitles v3 error:', e.message);
     }
+  } catch (e) {
+    console.warn('[AISUBS] OpenSubtitles v3 error:', e.message);
   }
 
-  // 3. SubDL API (Fallback)
+  // 3. SubDL API Fallback
   if (referenceEnSubs.length === 0 && config.subdlApiKey) {
     try {
       let subdlUrl = `https://api.subdl.com/api/v1/subtitles?api_key=${config.subdlApiKey}&imdb_id=${imdbId}&languages=EN,${targetIso1.toUpperCase()}&subs_per_page=4`;
@@ -392,35 +404,39 @@ app.use(async (req, res, next) => {
   const targetName = config.langName || 'Dutch';
   const outSubtitles = [];
 
-  // Track 1: Hash-synced reference subtitle translated with AI
+  // Track 1: Hash-synced reference subtitle translated with AI (with fallback URLs embedded)
   if (referenceEnSubs.length > 0) {
     const refSub = referenceEnSubs[0];
+    const altSub = referenceEnSubs[1];
     const syncBadge = refSub.isHashMatch ? '✓ Synced' : '⏳ Auto-Sync';
+
+    const srcParam = encodeSourceParam(refSub.url);
+    const altParam = altSub ? encodeSourceParam(altSub.url) : '';
 
     outSubtitles.push({
       id: `aisubs-ai-ref-0`,
-      url: `${host}/sub.vtt?cfg=${cfgString}&src=${encodeURIComponent(refSub.url)}&synced=true`,
+      url: `${host}/sub.vtt?cfg=${cfgString}&src=${srcParam}&alt=${altParam}&synced=true`,
       lang: targetIso3,
       label: `${syncBadge} [AI ${targetName}] · Gemini · ${refSub.release}`
     });
 
     if (referenceEnSubs.length > 1) {
-      const altSub = referenceEnSubs[1];
       outSubtitles.push({
         id: `aisubs-ai-ref-1`,
-        url: `${host}/sub.vtt?cfg=${cfgString}&src=${encodeURIComponent(altSub.url)}`,
+        url: `${host}/sub.vtt?cfg=${cfgString}&src=${altParam}&synced=true`,
         lang: targetIso3,
         label: `⏳ Sync Alternate [AI ${targetName}] · ${altSub.source}`
       });
     }
   }
 
-  // Track 2: Native target language subtitle (if exact match exists)
+  // Track 2: Native target language subtitle (if available)
   if (nativeTargetSubs.length > 0) {
     const topNative = nativeTargetSubs[0];
+    const srcParam = encodeSourceParam(topNative.url);
     outSubtitles.push({
       id: `aisubs-native-0`,
-      url: `${host}/sub.vtt?cfg=${cfgString}&src=${encodeURIComponent(topNative.url)}&raw=true`,
+      url: `${host}/sub.vtt?cfg=${cfgString}&src=${srcParam}&raw=true`,
       lang: targetIso3,
       label: `✓ Synced Native · ${topNative.source} · ${topNative.release}`
     });
@@ -431,31 +447,106 @@ app.use(async (req, res, next) => {
 });
 
 // ----------------------------------------------------
-// Decompression Engine (Handles GZIP, ZIP archives, and raw encodings)
+// Robust Multi-Candidate Subtitle Downloader
 // ----------------------------------------------------
-function decompressSubtitleBuffer(buffer) {
-  // 1. Gzip Stream (Magic bytes 0x1f 0x8b)
-  if (buffer.length > 2 && buffer[0] === 0x1f && buffer[1] === 0x8b) {
-    try {
-      const decomp = zlib.gunzipSync(buffer);
-      return decodeText(decomp);
-    } catch (e) {
-      console.warn('[AISUBS] Gunzip failed, attempting inflateRaw:', e.message);
+async function downloadSubtitleWithFallbacks(candidateUrls) {
+  let lastError = null;
+
+  for (let rawUrl of candidateUrls) {
+    if (!rawUrl) continue;
+    let targetUrl = rawUrl;
+
+    // Handle OpenSubtitles download resolution
+    if (targetUrl.includes('api.opensubtitles.com/api/v1/download')) {
       try {
-        const decomp = zlib.inflateRawSync(buffer.slice(10));
-        return decodeText(decomp);
-      } catch (err) {}
+        const u = new URL(targetUrl);
+        const fileId = u.searchParams.get('file_id');
+        const apiKey = u.searchParams.get('osApiKey');
+        const dlPost = await fetch('https://api.opensubtitles.com/api/v1/download', {
+          method: 'POST',
+          headers: {
+            'Api-Key': apiKey,
+            'User-Agent': 'AISUBS v2.2.0',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify({ file_id: Number(fileId) }),
+          signal: AbortSignal.timeout(6000)
+        });
+        const dlJson = await dlPost.json();
+        if (dlJson.link) {
+          targetUrl = dlJson.link;
+        } else {
+          console.warn('[AISUBS] OpenSubtitles download returned no link. Moving to next candidate...');
+          continue;
+        }
+      } catch (e) {
+        console.warn('[AISUBS] OpenSubtitles resolve failed:', e.message);
+        continue;
+      }
+    }
+
+    // Try multiple standard user-agents to avoid Cloudflare 503 bot triggers
+    const userAgents = [
+      'Stremio/4.4.168',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+      'AISUBS/2.2.0'
+    ];
+
+    for (const ua of userAgents) {
+      try {
+        console.log(`[AISUBS] Fetching candidate: ${targetUrl.slice(0, 65)}... [${ua.split('/')[0]}]`);
+        const res = await fetch(targetUrl, {
+          headers: {
+            'User-Agent': ua,
+            'Accept': '*/*',
+            'Accept-Encoding': 'gzip, deflate, br'
+          },
+          redirect: 'follow',
+          signal: AbortSignal.timeout(8000)
+        });
+
+        if (res.ok) {
+          const arrayBuf = await res.arrayBuffer();
+          const buffer = Buffer.from(arrayBuf);
+          if (buffer.length > 40) {
+            return { buffer, finalUrl: targetUrl };
+          }
+        } else {
+          console.warn(`[AISUBS] Candidate returned HTTP ${res.status}`);
+          lastError = new Error(`Download failed with HTTP ${res.status}`);
+        }
+      } catch (err) {
+        console.warn('[AISUBS] Candidate fetch attempt failed:', err.message);
+        lastError = err;
+      }
     }
   }
 
-  // 2. PKZip Archive (Magic bytes 'PK\x03\x04')
+  throw lastError || new Error('All candidate subtitle downloads failed');
+}
+
+// ----------------------------------------------------
+// Decompression Engine
+// ----------------------------------------------------
+function decompressSubtitleBuffer(buffer) {
+  // 1. Gzip Stream (0x1f 0x8b)
+  if (buffer.length > 2 && buffer[0] === 0x1f && buffer[1] === 0x8b) {
+    try {
+      return decodeText(zlib.gunzipSync(buffer));
+    } catch {
+      try {
+        return decodeText(zlib.inflateRawSync(buffer.slice(10)));
+      } catch {}
+    }
+  }
+
+  // 2. PKZip Archive ('PK\x03\x04')
   if (buffer.length > 4 && buffer[0] === 0x50 && buffer[1] === 0x4b && buffer[2] === 0x03 && buffer[3] === 0x04) {
     try {
       let offset = 0;
       while (offset < buffer.length - 30) {
-        if (buffer[offset] !== 0x50 || buffer[offset + 1] !== 0x4b || buffer[offset + 2] !== 0x03 || buffer[offset + 3] !== 0x04) {
-          break;
-        }
+        if (buffer[offset] !== 0x50 || buffer[offset + 1] !== 0x4b || buffer[offset + 2] !== 0x03 || buffer[offset + 3] !== 0x04) break;
         const compMethod = buffer.readUInt16LE(offset + 8);
         const compSize = buffer.readUInt32LE(offset + 18);
         const fnameLen = buffer.readUInt16LE(offset + 26);
@@ -467,17 +558,13 @@ function decompressSubtitleBuffer(buffer) {
         const fileBytes = buffer.slice(dataStart, dataEnd);
 
         if (fname.endsWith('.srt') || fname.endsWith('.vtt') || fname.endsWith('.ass') || fname.endsWith('.sub') || !fname.includes('.')) {
-          if (compMethod === 0) {
-            return decodeText(fileBytes);
-          } else if (compMethod === 8) {
-            const decomp = zlib.inflateRawSync(fileBytes);
-            return decodeText(decomp);
-          }
+          if (compMethod === 0) return decodeText(fileBytes);
+          if (compMethod === 8) return decodeText(zlib.inflateRawSync(fileBytes));
         }
         offset = dataEnd;
       }
     } catch (e) {
-      console.warn('[AISUBS] Zip decompression error:', e.message);
+      console.warn('[AISUBS] Zip decompress failed:', e.message);
     }
   }
 
@@ -491,13 +578,13 @@ function decodeText(buffer) {
 }
 
 // ----------------------------------------------------
-// Universal Cue Parser (SRT, WebVTT, ASS/SSA)
+// Universal Cue Parser
 // ----------------------------------------------------
 function parseSubtitleCues(raw) {
   const clean = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
   const cues = [];
 
-  // Check for ASS / SSA script events
+  // ASS / SSA Events
   if (clean.includes('[Events]') && clean.includes('Dialogue:')) {
     const lines = clean.split('\n');
     for (const line of lines) {
@@ -514,7 +601,7 @@ function parseSubtitleCues(raw) {
     if (cues.length > 0) return cues;
   }
 
-  // Regex matches 1 or 2 digit hours with comma or period decimals
+  // Regex matches 1 or 2 digit hours
   const timeRegex = /(\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3})/;
   const lines = clean.split('\n');
   let i = 0;
@@ -529,7 +616,6 @@ function parseSubtitleCues(raw) {
       const textLines = [];
       while (i < lines.length && lines[i].trim() !== '') {
         const textLine = lines[i].trim();
-        // Skip WebVTT cue settings or cue numbers
         if (!textLine.includes('-->')) textLines.push(textLine);
         i++;
       }
@@ -571,58 +657,28 @@ function padAssTime(t) {
 // Subtitle Stream & Translation Delivery (/sub.vtt)
 // ----------------------------------------------------
 app.get('/sub.vtt', async (req, res) => {
-  const { cfg, src, raw } = req.query;
+  const { cfg, src, alt, raw } = req.query;
   const config = parseConfig(cfg);
-  let sourceUrl = decodeURIComponent(src);
+
+  // Safely decode candidate URLs
+  const primaryUrl = decodeSourceParam(src);
+  const altUrl = decodeSourceParam(alt);
+  const candidates = [primaryUrl, altUrl].filter(Boolean);
 
   res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
   res.setHeader('Access-Control-Allow-Origin', '*');
 
   console.log(`\n[AISUBS-RENDER] Request for ${config.langName} (${config.lang})`);
 
-  // Resolve OpenSubtitles direct download link
-  if (sourceUrl.includes('api.opensubtitles.com/api/v1/download')) {
-    try {
-      const u = new URL(sourceUrl);
-      const fileId = u.searchParams.get('file_id');
-      const apiKey = u.searchParams.get('osApiKey');
-      const dlPost = await fetch('https://api.opensubtitles.com/api/v1/download', {
-        method: 'POST',
-        headers: {
-          'Api-Key': apiKey,
-          'User-Agent': 'AISUBS v2.1.0',
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify({ file_id: Number(fileId) })
-      });
-      const dlJson = await dlPost.json();
-      if (dlJson.link) sourceUrl = dlJson.link;
-    } catch (e) {
-      console.warn('[AISUBS] OpenSubtitles link resolution failed:', e.message);
-    }
-  }
-
-  const cacheKey = `${sourceUrl}_${config.lang}_${config.provider}_${config.offsetMs}_${config.bilingual}_${raw}`;
+  const cacheKey = `${primaryUrl}_${config.lang}_${config.provider}_${config.offsetMs}_${config.bilingual}_${raw}`;
   if (subCache.has(cacheKey)) {
     console.log('[AISUBS] Serving from cache (Instant)');
     return res.send(subCache.get(cacheKey));
   }
 
   try {
-    const subRes = await fetch(sourceUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': '*/*'
-      },
-      signal: AbortSignal.timeout(10000)
-    });
-
-    if (!subRes.ok) throw new Error(`Download failed with HTTP ${subRes.status}`);
-
-    const arrayBuf = await subRes.arrayBuffer();
-    const rawBuffer = Buffer.from(arrayBuf);
-    const decodedText = decompressSubtitleBuffer(rawBuffer);
+    const { buffer } = await downloadSubtitleWithFallbacks(candidates);
+    const decodedText = decompressSubtitleBuffer(buffer);
 
     const cues = parseSubtitleCues(decodedText);
     if (!cues || cues.length === 0) {
@@ -638,7 +694,7 @@ app.get('/sub.vtt', async (req, res) => {
       });
     }
 
-    // Skip AI translation if raw native track requested
+    // Skip AI translation if native track requested
     if (raw !== 'true') {
       const batchSize = 50;
       for (let i = 0; i < cues.length; i += batchSize) {
@@ -669,7 +725,7 @@ app.get('/sub.vtt', async (req, res) => {
   }
 });
 
-// Translation Providers
+// Translation Routing
 async function translateBatch(texts, targetLang, config) {
   const apiKey = (config.apiKey || ENV_GEMINI_KEY || '').trim();
   const provider = config.provider || 'gemini';
