@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AISUBS — AI Subtitles & Sync</title>
+  <title>AISUBS — AI Subtitle Translation & Sync</title>
   <link rel="stylesheet" href="style.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -15,7 +15,7 @@
 
   <main class="container">
     <header class="header">
-      <div class="badge">v1.4.0 • Context AI & Multi-Source</div>
+      <div class="badge">v1.4.0 • Gemini Scene-Translation</div>
       <h1>AISUBS</h1>
       <p class="subtitle">Real-time subtitle translation and sync for Stremio & Nuvio.</p>
     </header>
@@ -26,7 +26,7 @@
         <!-- 1. Target Language -->
         <div class="section-title">1. Target Language</div>
         <div class="form-group">
-          <label for="langSelect">Language Track</label>
+          <label for="langSelect">Target Subtitle Language</label>
           <div class="select-wrapper">
             <select id="langSelect">
               <option value="spa|Spanish|🇪🇸">🇪🇸 Spanish (Español)</option>
@@ -53,9 +53,45 @@
           </div>
         </div>
 
-        <!-- 2. Subtitle Sources -->
-        <div class="section-title">2. Subtitle Sources (Optional)</div>
-        <p class="section-desc">If left blank, the addon uses the built-in free OpenSubtitles proxy automatically.</p>
+        <!-- 2. AI Translation Engine -->
+        <div class="section-title">2. AI Translation Engine</div>
+        <div class="form-group">
+          <label for="providerSelect">Translation Provider</label>
+          <div class="select-wrapper">
+            <select id="providerSelect">
+              <option value="gemini" selected>✨ Google Gemini (Recommended - Free & Fast)</option>
+              <option value="groq">⚡ Groq (Llama 3.3 70B)</option>
+              <option value="openrouter">🌐 OpenRouter (Claude, DeepSeek, etc.)</option>
+              <option value="openai">🤖 OpenAI (GPT-4o mini)</option>
+              <option value="deepseek">🧠 DeepSeek API</option>
+              <option value="free">⚡ Free Web Engine (Keyless Fallback)</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="aiCredentials" class="credential-box">
+          <div class="box-header">
+            <span>Gemini / AI Credentials</span>
+            <span id="aiBadge" class="status-indicator"></span>
+          </div>
+          <div class="form-group">
+            <label for="apiKey">API Key</label>
+            <div class="input-with-eye">
+              <input type="password" id="apiKey" placeholder="AIzaSy... (Leave empty if set in Render env)">
+              <button type="button" class="eye-btn" data-target="apiKey">👁️</button>
+            </div>
+            <span class="helper">Get a free key in 30 seconds at <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:#818cf8;">Google AI Studio</a>.</span>
+          </div>
+          <div class="form-group">
+            <label for="modelInput">Model</label>
+            <input type="text" id="modelInput" value="gemini-2.0-flash" placeholder="gemini-2.0-flash">
+          </div>
+          <button type="button" id="verifyAiBtn" class="btn btn-sm">Verify AI Key</button>
+        </div>
+
+        <!-- 3. Subtitle Sources -->
+        <div class="section-title">3. Subtitle Sources (Optional)</div>
+        <p class="section-desc">Leave blank to use the built-in free OpenSubtitles source.</p>
 
         <!-- OpenSubtitles.com -->
         <div class="credential-box">
@@ -118,41 +154,6 @@
           <button type="button" id="verifySubsourceBtn" class="btn btn-sm">Verify SubSource</button>
         </div>
 
-        <!-- 3. AI Translation Engine -->
-        <div class="section-title">3. AI Translation Engine</div>
-        <div class="form-group">
-          <label for="providerSelect">Provider</label>
-          <div class="select-wrapper">
-            <select id="providerSelect">
-              <option value="gemini">✨ Google Gemini (Recommended - Fast & Free Quota)</option>
-              <option value="free">⚡ Free Web Engine (No API Key Required)</option>
-              <option value="groq">⚡ Groq (Llama 3.3 70B)</option>
-              <option value="openrouter">🌐 OpenRouter (Claude, DeepSeek, etc.)</option>
-              <option value="openai">🤖 OpenAI (GPT-4o mini)</option>
-              <option value="deepseek">🧠 DeepSeek API</option>
-            </select>
-          </div>
-        </div>
-
-        <div id="aiCredentials" class="credential-box">
-          <div class="box-header">
-            <span>AI Credentials</span>
-            <span id="aiBadge" class="status-indicator"></span>
-          </div>
-          <div class="form-group">
-            <label for="apiKey">API Key</label>
-            <div class="input-with-eye">
-              <input type="password" id="apiKey" placeholder="Paste your API key here">
-              <button type="button" class="eye-btn" data-target="apiKey">👁️</button>
-            </div>
-          </div>
-          <div class="form-group">
-            <label for="modelInput">Model (Optional)</label>
-            <input type="text" id="modelInput" placeholder="default (e.g. gemini-2.0-flash)">
-          </div>
-          <button type="button" id="verifyAiBtn" class="btn btn-sm">Verify AI Key</button>
-        </div>
-
         <!-- 4. Sync & Style -->
         <div class="section-title">4. Sync & Style</div>
         <div class="grid-2">
@@ -198,8 +199,8 @@
     <!-- QR Code Modal -->
     <div id="qrModal" class="modal hidden">
       <div class="modal-card">
-        <h3>Scan with TV / Nuvio</h3>
-        <p class="helper">Scan using your camera to open the install link.</p>
+        <h3>Scan to Install on TV</h3>
+        <p class="helper">Scan using your camera or Nuvio TV scanner.</p>
         <div id="qrCodeContainer"></div>
         <button id="closeModalBtn" class="btn btn-secondary" style="margin-top: 1rem;">Close</button>
       </div>
@@ -208,7 +209,6 @@
 
   <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
   <script>
-    // Eye toggles
     document.querySelectorAll('.eye-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         const input = document.getElementById(btn.getAttribute('data-target'));
@@ -319,7 +319,7 @@
         langName: langName,
         provider: providerSelect.value,
         apiKey: apiKey.value.trim(),
-        model: modelInput.value.trim() || 'default',
+        model: modelInput.value.trim() || 'gemini-2.0-flash',
         offsetMs: parseInt(offsetMs.value, 10) || 0,
         bilingual: bilingual.checked,
         osApiKey: osApiKey.value.trim(),
