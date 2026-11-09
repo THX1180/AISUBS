@@ -5,6 +5,10 @@ import { getManifest } from './manifest.js';
 const app = express();
 const PORT = process.env.PORT || 7860;
 
+// Read server-level environment variables (like Guy-Builds)
+const ENV_GEMINI_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
+const ENV_TARGET_LANG = process.env.TARGET_LANG || 'spa';
+
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 app.use(express.static('.'));
@@ -21,9 +25,6 @@ function setInCache(key, vtt) {
   subCache.set(key, vtt);
 }
 
-// ----------------------------------------------------
-// Language & Config Parsing (Supports Guy-Builds style /:lang and /:config)
-// ----------------------------------------------------
 const ISO_LANG_MAP = {
   spa: 'Spanish', nld: 'Dutch', fre: 'French', ger: 'German', ita: 'Italian',
   por: 'Portuguese', pob: 'Portuguese (Brazil)', rus: 'Russian', ara: 'Arabic',
@@ -33,27 +34,46 @@ const ISO_LANG_MAP = {
 };
 
 function parseConfig(raw) {
-  if (!raw) {
-    return { lang: 'spa', langName: 'Spanish', provider: 'free', offsetMs: 0 };
-  }
-  // If it's a short 3-letter code (Guy-Builds style: /spa/manifest.json)
+  const baseDefault = {
+    lang: ENV_TARGET_LANG,
+    langName: ISO_LANG_MAP[ENV_TARGET_LANG] || 'Spanish',
+    provider: ENV_GEMINI_KEY ? 'gemini' : 'gemini',
+    apiKey: ENV_GEMINI_KEY,
+    model: 'gemini-2.0-flash',
+    offsetMs: 0,
+    bilingual: false
+  };
+
+  if (!raw) return baseDefault;
+
+  // Short 3-letter language code (Guy-Builds style: /spa/manifest.json)
   if (/^[a-z]{3}$/i.test(raw)) {
     const code = raw.toLowerCase();
     return {
+      ...baseDefault,
       lang: code,
-      langName: ISO_LANG_MAP[code] || code.toUpperCase(),
-      provider: 'free',
-      offsetMs: 0
+      langName: ISO_LANG_MAP[code] || code.toUpperCase()
     };
   }
+
   try {
     const json = Buffer.from(raw, 'base64url').toString('utf-8');
-    return JSON.parse(json);
+    const parsed = JSON.parse(json);
+    return {
+      ...baseDefault,
+      ...parsed,
+      apiKey: parsed.apiKey || ENV_GEMINI_KEY
+    };
   } catch {
     try {
-      return JSON.parse(decodeURIComponent(raw));
+      const parsed = JSON.parse(decodeURIComponent(raw));
+      return {
+        ...baseDefault,
+        ...parsed,
+        apiKey: parsed.apiKey || ENV_GEMINI_KEY
+      };
     } catch {
-      return { lang: 'spa', langName: 'Spanish', provider: 'free', offsetMs: 0 };
+      return baseDefault;
     }
   }
 }
@@ -61,7 +81,7 @@ function parseConfig(raw) {
 // ----------------------------------------------------
 // Manifest Routes
 // ----------------------------------------------------
-app.get('/manifest.json', (req, res) => res.json(getManifest()));
+app.get('/manifest.json', (req, res) => res.json(getManifest(parseConfig(''))));
 
 app.get('/:param/manifest.json', (req, res) => {
   const config = parseConfig(req.params.param);
@@ -69,16 +89,13 @@ app.get('/:param/manifest.json', (req, res) => {
 });
 
 // ----------------------------------------------------
-// Credential Verification Endpoints
+// Verification Endpoints
 // ----------------------------------------------------
-
-// 1. OpenSubtitles (Validates Key, and tests login if user/pass provided)
 app.post('/api/verify-opensubtitles', async (req, res) => {
   const { apiKey, username, password } = req.body;
   if (!apiKey) return res.status(400).json({ valid: false, error: 'API Key is required' });
 
   try {
-    // Check API Key first
     const testRes = await fetch('https://api.opensubtitles.com/api/v1/subtitles?imdb_id=0111161&languages=en', {
       headers: {
         'Api-Key': apiKey,
@@ -92,7 +109,6 @@ app.post('/api/verify-opensubtitles', async (req, res) => {
       return res.status(400).json({ valid: false, error: 'Invalid OpenSubtitles API Key' });
     }
 
-    // If username and password provided, verify user account / VIP
     if (username && password) {
       const loginRes = await fetch('https://api.opensubtitles.com/api/v1/login', {
         method: 'POST',
@@ -109,7 +125,7 @@ app.post('/api/verify-opensubtitles', async (req, res) => {
       if (loginRes.ok && (loginData.token || loginData.status === 200)) {
         return res.json({ valid: true, user: loginData.user?.username || username });
       }
-      return res.status(400).json({ valid: false, error: `Login failed: ${loginData.message || 'Check username/password'}` });
+      return res.status(400).json({ valid: false, error: `Login failed: ${loginData.message || 'Check credentials'}` });
     }
 
     return res.json({ valid: true, user: 'API Key Verified' });
@@ -118,7 +134,6 @@ app.post('/api/verify-opensubtitles', async (req, res) => {
   }
 });
 
-// 2. SubDL
 app.post('/api/verify-subdl', async (req, res) => {
   const { apiKey } = req.body;
   if (!apiKey) return res.status(400).json({ valid: false, error: 'API Key is required' });
@@ -127,16 +142,13 @@ app.post('/api/verify-subdl', async (req, res) => {
       signal: AbortSignal.timeout(6000)
     });
     const data = await resp.json();
-    if (resp.ok && data.status !== false) {
-      return res.json({ valid: true });
-    }
+    if (resp.ok && data.status !== false) return res.json({ valid: true });
     return res.status(400).json({ valid: false, error: data.error || 'Invalid SubDL Key' });
   } catch (err) {
     return res.status(500).json({ valid: false, error: err.message });
   }
 });
 
-// 3. SubSource
 app.post('/api/verify-subsource', async (req, res) => {
   const { apiKey } = req.body;
   if (!apiKey) return res.status(400).json({ valid: false, error: 'API Key is required' });
@@ -152,16 +164,17 @@ app.post('/api/verify-subsource', async (req, res) => {
   }
 });
 
-// 4. AI Provider
 app.post('/api/verify-ai', async (req, res) => {
   const { provider, apiKey, model } = req.body;
+  const keyToTest = apiKey || ENV_GEMINI_KEY;
+
   if (provider === 'free') return res.json({ valid: true });
-  if (!apiKey) return res.status(400).json({ valid: false, error: 'API key is required' });
+  if (!keyToTest) return res.status(400).json({ valid: false, error: 'API key is required' });
 
   try {
     if (provider === 'gemini') {
-      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`, {
-        signal: AbortSignal.timeout(6000)
+      const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${keyToTest}`, {
+        signal: AbortSignal.timeout(7000)
       });
       if (resp.ok) return res.json({ valid: true });
       const err = await resp.json();
@@ -174,8 +187,8 @@ app.post('/api/verify-ai', async (req, res) => {
     if (provider === 'deepseek') endpoint = 'https://api.deepseek.com/models';
 
     const resp = await fetch(endpoint, {
-      headers: { 'Authorization': `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(6000)
+      headers: { 'Authorization': `Bearer ${keyToTest}` },
+      signal: AbortSignal.timeout(7000)
     });
     if (resp.ok) return res.json({ valid: true });
     const err = await resp.json();
@@ -186,18 +199,15 @@ app.post('/api/verify-ai', async (req, res) => {
 });
 
 // ----------------------------------------------------
-// Universal Subtitle Discovery (Handles all Stremio & Nuvio URL variations)
+// Universal Subtitle Discovery
 // ----------------------------------------------------
 app.use(async (req, res, next) => {
   if (!req.path.includes('/subtitles/')) {
     return next();
   }
 
-  // Regex extracts: /[:config]/subtitles/:type/:id (and strips any trailing .json or extra query args)
   const match = req.path.match(/(?:^|\/)([^/]+)?\/subtitles\/(movie|series)\/([a-zA-Z0-9:]+)/);
-  if (!match) {
-    return next();
-  }
+  if (!match) return next();
 
   const rawConfig = match[1] && match[1] !== 'subtitles' ? match[1] : '';
   const mediaType = match[2];
@@ -213,7 +223,7 @@ app.use(async (req, res, next) => {
 
   let candidates = [];
 
-  // 1. Check OpenSubtitles if API key configured
+  // 1. OpenSubtitles API
   if (config.osApiKey) {
     try {
       const cleanImdb = imdbId.replace('tt', '');
@@ -244,11 +254,11 @@ app.use(async (req, res, next) => {
         }
       }
     } catch (e) {
-      console.warn('OpenSubtitles fetch warning:', e.message);
+      console.warn('[AISUBS] OpenSubtitles search warning:', e.message);
     }
   }
 
-  // 2. Check SubDL if configured
+  // 2. SubDL API
   if (candidates.length === 0 && config.subdlApiKey) {
     try {
       let subdlUrl = `https://api.subdl.com/api/v1/subtitles?api_key=${config.subdlApiKey}&imdb_id=${imdbId}&languages=EN&subs_per_page=3`;
@@ -265,11 +275,11 @@ app.use(async (req, res, next) => {
         }
       }
     } catch (e) {
-      console.warn('SubDL fetch warning:', e.message);
+      console.warn('[AISUBS] SubDL search warning:', e.message);
     }
   }
 
-  // 3. Fallback to OpenSubtitles v3 public proxy (Universal Fallback)
+  // 3. Fallback: OpenSubtitles v3 proxy (Free, no key required)
   if (candidates.length === 0) {
     try {
       const pubUrl = `https://opensubtitles-v3.strem.io/subtitles/${mediaType}/${fullId}.json`;
@@ -288,7 +298,7 @@ app.use(async (req, res, next) => {
         }
       }
     } catch (e) {
-      console.warn('OpenSubtitles v3 proxy warning:', e.message);
+      console.warn('[AISUBS] OpenSubtitles v3 proxy warning:', e.message);
     }
   }
 
@@ -300,7 +310,6 @@ app.use(async (req, res, next) => {
   const targetIso3 = config.lang || 'spa';
   const targetName = config.langName || targetIso3.toUpperCase();
 
-  // Return the subtitle track with both 'lang' and 'label'
   const subtitles = candidates.map((sub, idx) => ({
     id: `aisubs-${imdbId}-${idx}`,
     url: `${host}/sub.vtt?cfg=${cfgString}&src=${encodeURIComponent(sub.url)}`,
@@ -313,7 +322,7 @@ app.use(async (req, res, next) => {
 });
 
 // ----------------------------------------------------
-// Subtitle Stream & Translation Endpoint (/sub.vtt)
+// Subtitle Stream & Translation Engine (/sub.vtt)
 // ----------------------------------------------------
 app.get('/sub.vtt', async (req, res) => {
   const { cfg, src } = req.query;
@@ -323,7 +332,10 @@ app.get('/sub.vtt', async (req, res) => {
   res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
   res.setHeader('Access-Control-Allow-Origin', '*');
 
-  // Handle OpenSubtitles download resolution if required
+  console.log(`\n[AISUBS] Requested Subtitle Stream for Language: ${config.langName} (${config.lang})`);
+  console.log(`[AISUBS] Source URL: ${sourceUrl.slice(0, 80)}...`);
+
+  // Handle OpenSubtitles download resolution
   if (sourceUrl.includes('api.opensubtitles.com/api/v1/download')) {
     try {
       const u = new URL(sourceUrl);
@@ -342,12 +354,13 @@ app.get('/sub.vtt', async (req, res) => {
       const dlJson = await dlPost.json();
       if (dlJson.link) sourceUrl = dlJson.link;
     } catch (e) {
-      console.warn('OpenSubtitles link download resolution error:', e.message);
+      console.warn('[AISUBS] OpenSubtitles link resolution error:', e.message);
     }
   }
 
   const cacheKey = `${sourceUrl}_${config.lang}_${config.provider}_${config.offsetMs}_${config.bilingual}`;
   if (subCache.has(cacheKey)) {
+    console.log('[AISUBS] Returning from cache (Instant response)');
     return res.send(subCache.get(cacheKey));
   }
 
@@ -361,6 +374,9 @@ app.get('/sub.vtt', async (req, res) => {
       throw new Error('No subtitle cues found');
     }
 
+    console.log(`[AISUBS] Parsed ${cues.length} dialogue cues. Starting translation...`);
+
+    // Sync offset
     if (config.offsetMs && config.offsetMs !== 0) {
       cues.forEach(c => {
         c.start = shiftTimestamp(c.start, config.offsetMs);
@@ -368,11 +384,13 @@ app.get('/sub.vtt', async (req, res) => {
       });
     }
 
-    // Translate in context chunks of 45 dialogue lines
-    const batchSize = 45;
+    // Context-aware batching (50 lines per chunk)
+    const batchSize = 50;
     for (let i = 0; i < cues.length; i += batchSize) {
       const chunk = cues.slice(i, i + batchSize);
       const texts = chunk.map(c => c.text);
+      console.log(`[AISUBS] Translating batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(cues.length / batchSize)} (${texts.length} lines)...`);
+
       const translated = await translateBatch(texts, config.langName || 'Spanish', config);
 
       chunk.forEach((c, idx) => {
@@ -381,50 +399,91 @@ app.get('/sub.vtt', async (req, res) => {
       });
     }
 
-    const vttOutput = buildWebVTT(cues);
+    // Inject on-screen status banner cue at the beginning of the video
+    const targetName = config.langName || 'Target Language';
+    const providerName = config.provider === 'gemini' ? 'Gemini AI' : (config.provider.toUpperCase());
+    const bannerText = `[ 🤖 AISUBS: Translated to ${targetName} via ${providerName} ]`;
+
+    const vttOutput = buildWebVTT(cues, bannerText);
     setInCache(cacheKey, vttOutput);
+
+    console.log(`[AISUBS] Successfully generated and cached translated subtitle (${cues.length} lines).`);
     res.send(vttOutput);
   } catch (err) {
-    console.error('Subtitle rendering error:', err.message);
-    res.send('WEBVTT\n\n1\n00:00:01.000 --> 00:00:05.000\n[AISubs: Translation timed out or source unavailable]');
+    console.error('[AISUBS] Critical Subtitle Error:', err.message);
+    res.send(`WEBVTT\n\n1\n00:00:01.000 --> 00:00:06.000\n[AISubs: Error loading or translating subtitles: ${err.message}]`);
   }
 });
 
-// Translation Providers
+// Translation Routing
 async function translateBatch(texts, targetLang, config) {
-  const { provider, apiKey, model } = config;
+  const apiKey = (config.apiKey || ENV_GEMINI_KEY || '').trim();
+  const provider = config.provider || 'gemini';
+  const model = config.model || 'gemini-2.0-flash';
 
   if (provider === 'gemini' && apiKey) {
     return translateWithGemini(texts, targetLang, apiKey, model);
   }
+
   if (['openrouter', 'openai', 'groq', 'deepseek'].includes(provider) && apiKey) {
     return translateWithOpenAICompatible(texts, targetLang, provider, apiKey, model);
   }
+
+  console.warn('[AISUBS] No valid AI key found. Using free web engine fallback...');
   return translateWithFreeFallback(texts, targetLang);
 }
 
+// 1. Google Gemini (With Automatic gemini-2.0-flash -> gemini-1.5-flash fallback)
 async function translateWithGemini(texts, targetLang, apiKey, model) {
-  const chosenModel = model && model !== 'default' ? model : 'gemini-2.0-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${chosenModel}:generateContent?key=${apiKey}`;
+  const modelsToTry = [
+    model && model !== 'default' ? model : 'gemini-2.0-flash',
+    'gemini-1.5-flash'
+  ];
 
-  // Context-aware instruction preserving cues
-  const prompt = `You are a film subtitle translator. Translate the following numbered dialogue into ${targetLang}. Preserve line numbering and tone. Return ONLY numbered lines with no comments or markdown code blocks:\n\n${texts.map((t, idx) => `${idx + 1}| ${t.replace(/\n/g, ' ')}`).join('\n')}`;
+  const prompt = `You are a film and television subtitle translator.
+Translate the following numbered dialogue lines into ${targetLang}.
+Preserve line numbers and the '|' delimiter. Example format: '1| Translated line'.
+Maintain the exact emotional tone, brevity, and punctuation.
+Return ONLY the numbered list of translations, with NO explanations, markdown code blocks, or greetings:
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.1 }
-    }),
-    signal: AbortSignal.timeout(10000)
-  });
+${texts.map((t, idx) => `${idx + 1}| ${t.replace(/\n/g, ' ')}`).join('\n')}`;
 
-  const data = await res.json();
-  const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  return parseNumberedReply(reply, texts);
+  for (const m of modelsToTry) {
+    try {
+      console.log(`[AISUBS] Calling Gemini API (model: ${m})...`);
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${apiKey}`;
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.15 }
+        }),
+        signal: AbortSignal.timeout(12000)
+      });
+
+      if (!res.ok) {
+        const errorBody = await res.text();
+        console.warn(`[AISUBS] Gemini ${m} returned HTTP ${res.status}:`, errorBody.slice(0, 160));
+        continue; // Try fallback model
+      }
+
+      const data = await res.json();
+      const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const parsed = parseNumberedReply(reply, texts);
+      console.log(`[AISUBS] Successfully translated batch via Gemini (${m}).`);
+      return parsed;
+    } catch (e) {
+      console.warn(`[AISUBS] Gemini ${m} network error:`, e.message);
+    }
+  }
+
+  console.error('[AISUBS] Both Gemini models failed. Falling back to free engine.');
+  return translateWithFreeFallback(texts, targetLang);
 }
 
+// 2. OpenAI / OpenRouter / Groq / DeepSeek
 async function translateWithOpenAICompatible(texts, targetLang, provider, apiKey, model) {
   let endpoint = 'https://api.openai.com/v1/chat/completions';
   let defaultModel = 'gpt-4o-mini';
@@ -443,25 +502,31 @@ async function translateWithOpenAICompatible(texts, targetLang, provider, apiKey
   const chosenModel = model && model !== 'default' ? model : defaultModel;
   const prompt = `Translate dialogue cues into ${targetLang}. Return ONLY lines formatted as [index]| [translated line]:\n\n${texts.map((t, idx) => `${idx + 1}| ${t.replace(/\n/g, ' ')}`).join('\n')}`;
 
-  const res = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      model: chosenModel,
-      temperature: 0.1,
-      messages: [{ role: 'user', content: prompt }]
-    }),
-    signal: AbortSignal.timeout(10000)
-  });
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: chosenModel,
+        temperature: 0.1,
+        messages: [{ role: 'user', content: prompt }]
+      }),
+      signal: AbortSignal.timeout(12000)
+    });
 
-  const data = await res.json();
-  const reply = data.choices?.[0]?.message?.content || '';
-  return parseNumberedReply(reply, texts);
+    const data = await res.json();
+    const reply = data.choices?.[0]?.message?.content || '';
+    return parseNumberedReply(reply, texts);
+  } catch (e) {
+    console.error(`[AISUBS] ${provider} error:`, e.message);
+    return translateWithFreeFallback(texts, targetLang);
+  }
 }
 
+// 3. Free Web Engine Fallback
 async function translateWithFreeFallback(texts, targetLang) {
   const results = [];
   for (const text of texts) {
@@ -480,11 +545,15 @@ async function translateWithFreeFallback(texts, targetLang) {
 }
 
 function parseNumberedReply(reply, original) {
-  const lines = reply.split('\n').filter(l => l.trim().length > 0);
+  const clean = reply.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '').trim();
+  const lines = clean.split('\n').filter(l => l.trim().length > 0);
   const map = new Map();
+
   for (const line of lines) {
-    const match = line.match(/^(\d+)[\|\.\:\)]\s*(.*)$/);
-    if (match) map.set(parseInt(match[1], 10), match[2].trim());
+    const match = line.match(/^(\d+)\s*[\|\.\:\-\)]\s*(.*)$/);
+    if (match) {
+      map.set(parseInt(match[1], 10), match[2].trim());
+    }
   }
   return original.map((orig, idx) => map.get(idx + 1) || orig);
 }
@@ -515,11 +584,21 @@ function parseSubtitleCues(raw) {
   return cues;
 }
 
-function buildWebVTT(cues) {
+// Injects the banner cue at the beginning
+function buildWebVTT(cues, bannerText) {
   let vtt = 'WEBVTT\n\n';
-  cues.forEach((cue, idx) => {
-    vtt += `${idx + 1}\n${cue.start} --> ${cue.end}\n${cue.text}\n\n`;
+  let cueIndex = 1;
+
+  if (bannerText) {
+    vtt += `${cueIndex}\n00:00:00.800 --> 00:00:06.000\n${bannerText}\n\n`;
+    cueIndex++;
+  }
+
+  cues.forEach(cue => {
+    vtt += `${cueIndex}\n${cue.start} --> ${cue.end}\n${cue.text}\n\n`;
+    cueIndex++;
   });
+
   return vtt;
 }
 
@@ -545,5 +624,10 @@ function shiftTimestamp(ts, offsetMs) {
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`AISUBS server running on port ${PORT}`);
+  console.log(`[AISUBS] Server running on port ${PORT}`);
+  if (ENV_GEMINI_KEY) {
+    console.log('[AISUBS] Environment GEMINI_API_KEY detected and enabled.');
+  } else {
+    console.log('[AISUBS] Note: No GEMINI_API_KEY environment variable set. You can provide one via the web dashboard.');
+  }
 });
