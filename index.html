@@ -1,147 +1,222 @@
-<!doctype html>
-<html lang="nl">
+<!DOCTYPE html>
+<html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SubNova – AI Nederlandse ondertitels</title>
-<style>
-  :root { --bg:#f5f6f8; --card:#fff; --text:#1c1f24; --muted:#6a7280; --line:#d9dde3; --accent:#6c5ce7; --ok:#1a9d5b; --err:#d63c3c; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#0f1115; --card:#181b21; --text:#eceff4; --muted:#9aa3b2; --line:#2a2f38; --accent:#8b7dff; --ok:#38c987; --err:#ff6b6b; }
-  }
-  * { box-sizing:border-box; }
-  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); padding:16px; }
-  .wrap { max-width:560px; margin:0 auto; }
-  h1 { font-size:1.4rem; margin:8px 0 4px; }
-  .sub { color:var(--muted); font-size:.9rem; margin-bottom:16px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:14px; }
-  .card h2 { font-size:1rem; margin:0 0 10px; }
-  label { display:block; font-size:.8rem; color:var(--muted); margin:10px 0 4px; }
-  input { width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:transparent; color:var(--text); font-size:.95rem; }
-  button { padding:10px 14px; border-radius:8px; border:0; background:var(--accent); color:#fff; font-size:.95rem; cursor:pointer; }
-  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--accent); }
-  .row { display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap; }
-  .status { font-size:.85rem; }
-  .ok { color:var(--ok); } .err { color:var(--err); }
-  #out { word-break:break-all; font-size:.8rem; color:var(--muted); margin-top:10px; }
-  .hidden { display:none; }
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AISUBS — AI Subtitle Translator & Sync</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
 <body>
-<div class="wrap">
-  <h1>SubNova</h1>
-  <div class="sub">Nederlandse ondertitels, met AI-vertaling als er geen NL beschikbaar is.</div>
+  <div class="blob-bg blob-1"></div>
+  <div class="blob-bg blob-2"></div>
 
-  <div class="card">
-    <h2>Gemini (AI vertaling)</h2>
-    <label>API key</label>
-    <input id="geminiKey" type="password" autocomplete="off">
-    <label>Model (optioneel)</label>
-    <input id="geminiModel" placeholder="gemini-2.5-flash">
-    <div class="row"><button class="ghost" onclick="validate('gemini')">Test</button><span id="s-gemini" class="status"></span></div>
-  </div>
+  <main class="container">
+    <header class="header">
+      <div class="badge">v1.2.0 • Ultra Fast & Sync</div>
+      <h1>AISUBS</h1>
+      <p class="subtitle">AI-powered on-demand subtitle translation and audio sync for Stremio & Nuvio.</p>
+    </header>
 
-  <div class="card">
-    <h2>OpenSubtitles</h2>
-    <label>API key</label>
-    <input id="osApiKey" type="password" autocomplete="off">
-    <label>Gebruikersnaam (optioneel)</label>
-    <input id="osUsername" autocomplete="off">
-    <label>Wachtwoord (optioneel)</label>
-    <input id="osPassword" type="password" autocomplete="off">
-    <div class="row"><button class="ghost" onclick="validate('opensubtitles')">Test</button><span id="s-opensubtitles" class="status"></span></div>
-  </div>
+    <div class="glass-card">
+      <form id="configForm">
+        <!-- Target Language -->
+        <div class="form-group">
+          <label for="langSelect">Target Language</label>
+          <div class="select-wrapper">
+            <select id="langSelect">
+              <option value="spa|Spanish|🇪🇸">🇪🇸 Spanish (Español)</option>
+              <option value="fre|French|🇫🇷">🇫🇷 French (Français)</option>
+              <option value="ger|German|🇩🇪">🇩🇪 German (Deutsch)</option>
+              <option value="ita|Italian|🇮🇹">🇮🇹 Italian (Italiano)</option>
+              <option value="por|Portuguese|🇧🇷">🇧🇷 Portuguese (Português)</option>
+              <option value="rus|Russian|🇷🇺">🇷🇺 Russian (Русский)</option>
+              <option value="ara|Arabic|🇸🇦">🇸🇦 Arabic (العربية)</option>
+              <option value="nld|Dutch|🇳🇱">🇳🇱 Dutch (Nederlands)</option>
+              <option value="tur|Turkish|🇹🇷">🇹🇷 Turkish (Türkçe)</option>
+              <option value="pol|Polish|🇵🇱">🇵🇱 Polish (Polski)</option>
+              <option value="jpn|Japanese|🇯🇵">🇯🇵 Japanese (日本語)</option>
+              <option value="kor|Korean|🇰🇷">🇰🇷 Korean (한국어)</option>
+              <option value="chi|Chinese|🇨🇳">🇨🇳 Chinese (中文)</option>
+              <option value="hin|Hindi|🇮🇳">🇮🇳 Hindi (हिन्दी)</option>
+              <option value="swe|Swedish|🇸🇪">🇸🇪 Swedish (Svenska)</option>
+              <option value="ell|Greek|🇬🇷">🇬🇷 Greek (Ελληνικά)</option>
+              <option value="ukr|Ukrainian|🇺🇦">🇺🇦 Ukrainian (Українська)</option>
+              <option value="ind|Indonesian|🇮🇩">🇮🇩 Indonesian (Bahasa Indonesia)</option>
+            </select>
+          </div>
+        </div>
 
-  <div class="card">
-    <h2>SubDL</h2>
-    <label>API key</label>
-    <input id="subdlKey" type="password" autocomplete="off">
-    <div class="row"><button class="ghost" onclick="validate('subdl')">Test</button><span id="s-subdl" class="status"></span></div>
-  </div>
+        <!-- AI Provider -->
+        <div class="form-group">
+          <label for="providerSelect">Translation Engine</label>
+          <div class="select-wrapper">
+            <select id="providerSelect">
+              <option value="free">⚡ Free Web Engine (No API Key Required)</option>
+              <option value="gemini">✨ Google Gemini (Recommended - Free & Fast)</option>
+              <option value="groq">⚡ Groq (Ultra-Fast Llama 3.3)</option>
+              <option value="openrouter">🌐 OpenRouter (Claude, DeepSeek, etc.)</option>
+              <option value="openai">🤖 OpenAI (GPT-4o mini)</option>
+              <option value="deepseek">🧠 DeepSeek API</option>
+            </select>
+          </div>
+        </div>
 
-  <div class="card">
-    <h2>SubSource</h2>
-    <label>API key</label>
-    <input id="subsourceKey" type="password" autocomplete="off">
-    <div class="row"><button class="ghost" onclick="validate('subsource')">Test</button><span id="s-subsource" class="status"></span></div>
-  </div>
+        <!-- API Key & Model (Conditional) -->
+        <div id="aiCredentials" class="hidden-field">
+          <div class="form-group">
+            <label for="apiKey">API Key</label>
+            <input type="password" id="apiKey" placeholder="Paste your API key here">
+          </div>
 
-  <div class="card">
-    <h2>Installeren</h2>
-    <div class="row">
-      <button onclick="installStremio()">Installeer in Stremio</button>
-      <button class="ghost" onclick="copyUrl()">Kopieer manifest-URL</button>
+          <div class="form-group">
+            <label for="modelInput">Model Name (Optional)</label>
+            <input type="text" id="modelInput" placeholder="default (e.g. gemini-2.0-flash)">
+          </div>
+        </div>
+
+        <!-- Sync Offset & Bilingual -->
+        <div class="grid-2">
+          <div class="form-group">
+            <label for="offsetMs">Sync Offset (ms)</label>
+            <input type="number" id="offsetMs" value="0" step="100" placeholder="0">
+            <span class="helper">Negative = earlier, Positive = delay</span>
+          </div>
+
+          <div class="form-group checkbox-group">
+            <label class="custom-switch">
+              <input type="checkbox" id="bilingual">
+              <span class="slider"></span>
+            </label>
+            <div class="switch-meta">
+              <span class="switch-title">Dual Subtitles</span>
+              <span class="helper">Shows original + translated lines</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="actions">
+          <button type="button" id="installBtn" class="btn btn-primary">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Install in Stremio
+          </button>
+          
+          <button type="button" id="copyBtn" class="btn btn-secondary">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            Copy Addon URL (Nuvio)
+          </button>
+
+          <button type="button" id="qrBtn" class="btn btn-icon" title="Scan QR Code for Android / TV">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+          </button>
+        </div>
+
+        <div id="statusToast" class="toast hidden"></div>
+      </form>
     </div>
-    <div class="status" id="s-install"></div>
-    <div id="out"></div>
-  </div>
-</div>
 
-<script>
-const FIELDS = ['geminiKey','geminiModel','osApiKey','osUsername','osPassword','subdlKey','subsourceKey'];
-const val = (id) => document.getElementById(id).value.trim();
+    <!-- QR Code Modal -->
+    <div id="qrModal" class="modal hidden">
+      <div class="modal-card">
+        <h3>Scan with Nuvio or Phone</h3>
+        <p class="helper">Scan with your TV app camera or phone to install.</p>
+        <div id="qrCodeContainer"></div>
+        <button id="closeModalBtn" class="btn btn-secondary" style="margin-top: 1rem;">Close</button>
+      </div>
+    </div>
+  </main>
 
-function buildConfig() {
-  const cfg = {};
-  FIELDS.forEach((f) => { if (val(f)) cfg[f] = val(f); });
-  return cfg;
-}
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+  <script>
+    const providerSelect = document.getElementById('providerSelect');
+    const aiCredentials = document.getElementById('aiCredentials');
+    const langSelect = document.getElementById('langSelect');
+    const apiKey = document.getElementById('apiKey');
+    const modelInput = document.getElementById('modelInput');
+    const offsetMs = document.getElementById('offsetMs');
+    const bilingual = document.getElementById('bilingual');
+    const installBtn = document.getElementById('installBtn');
+    const copyBtn = document.getElementById('copyBtn');
+    const qrBtn = document.getElementById('qrBtn');
+    const qrModal = document.getElementById('qrModal');
+    const closeModalBtn = document.getElementById('closeModalBtn');
+    const statusToast = document.getElementById('statusToast');
 
-function encodeConfig(cfg) {
-  const json = JSON.stringify(cfg);
-  const b64 = btoa(unescape(encodeURIComponent(json)));
-  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
+    function toggleCredentials() {
+      if (providerSelect.value === 'free') {
+        aiCredentials.classList.add('hidden-field');
+      } else {
+        aiCredentials.classList.remove('hidden-field');
+      }
+    }
+    providerSelect.addEventListener('change', toggleCredentials);
+    toggleCredentials();
 
-function manifestUrl() {
-  const cfg = buildConfig();
-  const base = location.origin;
-  return Object.keys(cfg).length
-    ? `${base}/${encodeConfig(cfg)}/manifest.json`
-    : `${base}/manifest.json`;
-}
+    function buildManifestUrl() {
+      const [langCode, langName] = langSelect.value.split('|');
+      const config = {
+        lang: langCode,
+        langName: langName,
+        provider: providerSelect.value,
+        apiKey: apiKey.value.trim(),
+        model: modelInput.value.trim() || 'default',
+        offsetMs: parseInt(offsetMs.value, 10) || 0,
+        bilingual: bilingual.checked
+      };
 
-async function validate(kind) {
-  const el = document.getElementById('s-' + kind);
-  el.className = 'status'; el.textContent = 'Bezig...';
-  const body = {
-    gemini: { apiKey: val('geminiKey'), model: val('geminiModel') },
-    opensubtitles: { apiKey: val('osApiKey'), username: val('osUsername'), password: val('osPassword') },
-    subdl: { apiKey: val('subdlKey') },
-    subsource: { apiKey: val('subsourceKey') }
-  }[kind];
-  try {
-    const r = await fetch('/api/validate/' + kind, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
+      const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(config))))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+      const origin = window.location.origin;
+      return `${origin}/${b64}/manifest.json`;
+    }
+
+    function showToast(msg) {
+      statusToast.textContent = msg;
+      statusToast.classList.remove('hidden');
+      setTimeout(() => statusToast.classList.add('hidden'), 3500);
+    }
+
+    installBtn.addEventListener('click', () => {
+      const manifestUrl = buildManifestUrl();
+      const stremioProtocol = manifestUrl.replace(/^https?:\/\//, 'stremio://');
+      window.location.href = stremioProtocol;
     });
-    const d = await r.json();
-    el.className = 'status ' + (d.success ? 'ok' : 'err');
-    el.textContent = d.success ? '✓ ' + d.message : '✗ ' + d.error;
-  } catch (e) {
-    el.className = 'status err';
-    el.textContent = '✗ Server niet bereikbaar';
-  }
-}
 
-function installStremio() {
-  const url = manifestUrl();
-  document.getElementById('out').textContent = url;
-  location.href = url.replace(/^https?:\/\//, 'stremio://');
-}
+    copyBtn.addEventListener('click', async () => {
+      const manifestUrl = buildManifestUrl();
+      try {
+        await navigator.clipboard.writeText(manifestUrl);
+        showToast('✓ Addon URL copied! Paste into Nuvio or Stremio.');
+      } catch {
+        prompt('Copy your addon URL:', manifestUrl);
+      }
+    });
 
-async function copyUrl() {
-  const url = manifestUrl();
-  document.getElementById('out').textContent = url;
-  const s = document.getElementById('s-install');
-  try {
-    await navigator.clipboard.writeText(url);
-    s.className = 'status ok'; s.textContent = '✓ Gekopieerd. Plak in Stremio of Nuvio.';
-  } catch (e) {
-    s.className = 'status'; s.textContent = 'Kopieer de URL hieronder handmatig.';
-  }
-}
-</script>
+    qrBtn.addEventListener('click', () => {
+      const manifestUrl = buildManifestUrl();
+      const container = document.getElementById('qrCodeContainer');
+      container.innerHTML = '';
+      new QRCode(container, {
+        text: manifestUrl,
+        width: 190,
+        height: 190,
+        colorDark: "#ffffff",
+        colorLight: "#0f131d",
+        correctLevel: QRCode.CorrectLevel.M
+      });
+      qrModal.classList.remove('hidden');
+    });
+
+    closeModalBtn.addEventListener('click', () => qrModal.classList.add('hidden'));
+    qrModal.addEventListener('click', (e) => {
+      if (e.target === qrModal) qrModal.classList.add('hidden');
+    });
+  </script>
 </body>
 </html>
