@@ -1,828 +1,340 @@
-require('dotenv').config();
-const express = require('express');
-const axios = require('axios');
-const AdmZip = require('adm-zip');
-const crypto = require('crypto');
-const { MongoClient } = require('mongodb');
-const {
-  GoogleGenerativeAI,
-  HarmCategory,
-  HarmBlockThreshold
-} = require('@google/generative-ai');
-const manifest = require('./manifest');
+import express from 'express';
+import cors from 'cors';
+import { getManifest } from './manifest.js';
 
 const app = express();
 const PORT = process.env.PORT || 7860;
 
-// FIX 1: Render terminates TLS at a proxy. Without this, req.protocol is "http"
-app.set('trust proxy', true);
-
-// Log every request so problems are visible in Render logs
-app.use((req, res, next) => {
-  if (!req.path.startsWith('/health')) {
-    console.log(`➡️ ${req.method} ${req.path.slice(0, 80)}`);
-  }
-  next();
-});
-
-process.on('uncaughtException', (err) => {
-  console.error('❌ uncaughtException:', err.message);
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('❌ unhandledRejection:', reason);
-});
-
+// Middleware
+app.use(cors({ origin: '*' }));
 app.use(express.json());
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
-  next();
-});
+app.use(express.static('.'));
 
-// Always hand out https URLs for subtitle files
-function getHost(req) {
-  const fixed = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL;
-  if (fixed) return fixed.replace(/\/+$/, '');
-  return `https://${req.get('host')}`;
-}
+// Cache: key -> WebVTT string
+const subCache = new Map();
+const MAX_CACHE_SIZE = 500;
 
-// ---------- MongoDB ----------
-let db = null;
-if (process.env.MONGODB_URI) {
-  try {
-    const client = new MongoClient(process.env.MONGODB_URI, { maxPoolSize: 10 });
-    client.connect()
-      .then(async () => {
-        db = client.db('subnova_cache');
-        await db.collection('translations')
-          .createIndex({ cacheKey: 1 }, { unique: true });
-        console.log('✅ Verbonden met MongoDB Cache');
-      })
-      .catch((err) => console.error('⚠️ MongoDB fout:', err.message));
-  } catch (err) {
-    console.error('⚠️ Ongeldige MongoDB URL:', err.message);
+function setInCache(key, vtt) {
+  if (subCache.size >= MAX_CACHE_SIZE) {
+    const firstKey = subCache.keys().next().value;
+    subCache.delete(firstKey);
   }
+  subCache.set(key, vtt);
 }
 
-const osTokenCache = new Map();
-const memCache = new Map();      // fallback when Mongo is unavailable
-const inflight = new Map();      // running translation jobs
-const failed = new Map();        // cacheKey -> expiry timestamp
-
+// Config parser
 function parseConfig(rawConfig) {
-  if (!rawConfig) return {};
+  if (!rawConfig) {
+    return {
+      lang: 'spa',
+      langName: 'Spanish',
+      provider: 'free',
+      apiKey: '',
+      model: 'default',
+      offsetMs: 0,
+      bilingual: false
+    };
+  }
   try {
-    let str = rawConfig.replace(/-/g, '+').replace(/_/g, '/');
-    while (str.length % 4) str += '=';
-    return JSON.parse(Buffer.from(str, 'base64').toString('utf8'));
-  } catch (e) {
-    return {};
-  }
-}
-
-// ---------- Payload encryption (keeps API keys out of readable URLs) ----------
-const SECRET = crypto
-  .createHash('sha256')
-  .update(process.env.PAYLOAD_SECRET || 'subnova-default-secret-change-me')
-  .digest();
-
-function encryptPayload(obj) {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', SECRET, iv);
-  const enc = Buffer.concat([
-    cipher.update(JSON.stringify(obj), 'utf8'),
-    cipher.final()
-  ]);
-  const tag = cipher.getAuthTag();
-  return Buffer.concat([iv, tag, enc]).toString('base64url');
-}
-
-function decryptPayload(str) {
-  const buf = Buffer.from(str, 'base64url');
-  const iv = buf.subarray(0, 12);
-  const tag = buf.subarray(12, 28);
-  const enc = buf.subarray(28);
-  const decipher = crypto.createDecipheriv('aes-256-gcm', SECRET, iv);
-  decipher.setAuthTag(tag);
-  const dec = Buffer.concat([decipher.update(enc), decipher.final()]);
-  return JSON.parse(dec.toString('utf8'));
-}
-
-const withTimeout = (promise, ms = 7000) =>
-  Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve([]), ms))]);
-
-const safetySettings = [
-  HarmCategory.HARM_CATEGORY_HARASSMENT,
-  HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-  HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-  HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT
-].map((category) => ({ category, threshold: HarmBlockThreshold.BLOCK_NONE }));
-
-// ---------- SRT -> WebVTT ----------
-function srtToVtt(srtText) {
-  if (!srtText || typeof srtText !== 'string') {
-    return 'WEBVTT\n\n00:00:01.000 --> 00:00:04.000\n[Geen subs]\n\n';
-  }
-  let clean = srtText.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
-  if (clean.charCodeAt(0) === 0xFEFF) clean = clean.substring(1);
-  if (clean.startsWith('WEBVTT')) return clean + '\n';
-  const converted = clean.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
-  return `WEBVTT\n\n${converted}\n`;
-}
-
-// Decode as UTF-8, fall back to latin1 (covers most windows-1252 Dutch SRTs)
-function decodeText(buffer) {
-  const utf8 = buffer.toString('utf8');
-  return utf8.includes('\uFFFD') ? buffer.toString('latin1') : utf8;
-}
-
-// ---------- Gemini (chunked + parallel, so it finishes in ~30-60s) ----------
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function splitSrt(raw, size = 100) {
-  const blocks = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim().split(/\n{2,}/);
-  const chunks = [];
-  for (let i = 0; i < blocks.length; i += size) {
-    chunks.push(blocks.slice(i, i + size).join('\n\n'));
-  }
-  return chunks;
-}
-
-const countCues = (t) => (t.match(/-->/g) || []).length;
-
-async function translateChunk(genAI, modelNames, chunk, idx) {
-  const prompt = `Je bent een filmvertaler. Vertaal deze Engelse SRT-fragmenten naar natuurlijk Nederlands.
-REGELS:
-1. Behoud exact alle nummers en timestamps.
-2. Wijzig de tijdcodes nooit en laat geen blok weg.
-3. Vertaal uitsluitend dialoog.
-4. Geef alleen de SRT terug, geen introductie of markdown.
-
-SRT:
-${chunk}`;
-
-  const expected = countCues(chunk);
-  let lastErr;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    for (const modelName of modelNames) {
-      try {
-        const model = genAI.getGenerativeModel({
-          model: modelName,
-          safetySettings,
-          generationConfig: { maxOutputTokens: 16384, temperature: 0.1 }
-        });
-        const result = await model.generateContent(prompt);
-        const text = result.response.text()
-          .replace(/^```(?:srt)?\s*/i, '')
-          .replace(/```\s*$/i, '')
-          .trim();
-        if (countCues(text) >= Math.floor(expected * 0.9)) return text;
-        throw new Error(`blok ${idx}: ${countCues(text)}/${expected} cues terug`);
-      } catch (err) {
-        console.error(`[Gemini] ${modelName} chunk ${idx} faalde:`, err.message);
-        lastErr = err;
-      }
+    const json = Buffer.from(rawConfig, 'base64url').toString('utf-8');
+    return JSON.parse(json);
+  } catch {
+    try {
+      return JSON.parse(decodeURIComponent(rawConfig));
+    } catch {
+      return { lang: 'spa', langName: 'Spanish', provider: 'free', offsetMs: 0 };
     }
-    await sleep(1500);
   }
-  console.error(`[Gemini] chunk ${idx} blijft Engels:`, lastErr && lastErr.message);
-  return chunk; // fall back to English for this chunk instead of failing entirely
 }
 
-async function translateFullSrtWithGemini(rawSrt, geminiKey, preferredModel) {
-  const apiKey = geminiKey || process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('Geen Gemini API Key beschikbaar');
-
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const modelNames = [...new Set([
-    preferredModel,
-    process.env.GEMINI_MODEL,
-    'gemini-2.5-flash',
-    'gemini-2.5-flash-lite'
-  ].filter(Boolean))];
-
-  const chunks = splitSrt(rawSrt, 100);
-  console.log(`[Gemini] ${chunks.length} delen vertalen (${modelNames.join(', ')})`);
-
-  const results = new Array(chunks.length);
-  let next = 0;
-  const CONCURRENCY = 4;
-  await Promise.all(
-    Array.from({ length: Math.min(CONCURRENCY, chunks.length) }, async () => {
-      while (next < chunks.length) {
-        const idx = next++;
-        results[idx] = await translateChunk(genAI, modelNames, chunks[idx], idx);
-      }
-    })
-  );
-  return results.join('\n\n');
-}
-
-// ================= VALIDATIE ENDPOINTS ================= //
-
-app.post('/api/validate/gemini', async (req, res) => {
-  const { apiKey, model } = req.body;
-  if (!apiKey) return res.json({ success: false, error: 'Vul een sleutel in' });
-  try {
-    const genAI = new GoogleGenerativeAI(apiKey.trim());
-    const m = genAI.getGenerativeModel({ model: model || 'gemini-2.5-flash' });
-    await m.countTokens('Test');
-    return res.json({ success: true, message: 'Gemini API is actief!' });
-  } catch (err) {
-    console.error('[Gemini validate]', err.message);
-    return res.json({ success: false, error: 'Ongeldige Gemini sleutel of model' });
-  }
+// ----------------------------------------------------
+// Manifest Endpoints
+// ----------------------------------------------------
+app.get('/manifest.json', (req, res) => {
+  res.json(getManifest());
 });
 
-app.post('/api/validate/opensubtitles', async (req, res) => {
-  const { apiKey, username, password } = req.body;
-  if (!apiKey) return res.json({ success: false, error: 'API Key ontbreekt' });
+app.get('/:config/manifest.json', (req, res) => {
+  const config = parseConfig(req.params.config);
+  res.json(getManifest(config));
+});
+
+// ----------------------------------------------------
+// Subtitles Metadata Handler (< 200ms)
+// ----------------------------------------------------
+async function handleSubtitles(req, res, config) {
+  const { type, id } = req.params;
+  const cleanId = id.replace('.json', '');
+  const host = `${req.protocol}://${req.get('host')}`;
+
   try {
-    if (username && password) {
-      const loginRes = await axios.post(
-        'https://api.opensubtitles.com/api/v1/login',
-        { username: username.trim(), password: password.trim() },
-        {
-          headers: {
-            'Api-Key': apiKey.trim(),
-            'Content-Type': 'application/json',
-            'User-Agent': 'SubNova-v2.0'
-          },
-          timeout: 6000
-        }
-      );
-      if (loginRes.data?.token) {
-        const u = loginRes.data.user?.username || username;
-        return res.json({ success: true, message: `Ingelogd als ${u}!` });
+    // Fetch source subtitles from Stremio's free OpenSubtitles v3 proxy
+    const osUrl = `https://opensubtitles-v3.strem.io/subtitles/${type}/${cleanId}.json`;
+    const resp = await fetch(osUrl, {
+      headers: { 'User-Agent': 'AISubs/1.2.0' },
+      signal: AbortSignal.timeout(4000)
+    });
+
+    let candidates = [];
+    if (resp.ok) {
+      const data = await resp.json();
+      if (Array.isArray(data.subtitles)) {
+        // Prioritize English or original source subtitles
+        candidates = data.subtitles.filter(s => s.lang === 'eng' || s.lang === 'en');
+        if (candidates.length === 0) candidates = data.subtitles.slice(0, 3);
       }
-      return res.json({ success: false, error: 'Inloggen mislukt' });
     }
-    await axios.get('https://api.opensubtitles.com/api/v1/infos/formats', {
-      headers: { 'Api-Key': apiKey.trim(), 'User-Agent': 'SubNova-v2.0' },
-      timeout: 5000
-    });
-    return res.json({ success: true, message: 'API Key is geldig!' });
-  } catch (err) {
-    return res.json({ success: false, error: 'Inloggen mislukt' });
-  }
-});
 
-app.post('/api/validate/subdl', async (req, res) => {
-  const { apiKey } = req.body;
-  if (!apiKey) return res.json({ success: false, error: 'Key ontbreekt' });
-  try {
-    const r = await axios.get('https://api.subdl.com/api/v1/subtitles', {
-      params: { api_key: apiKey.trim(), imdb_id: 'tt0111161' },
-      timeout: 5000
-    });
-    if (r.data?.status === true || r.data?.subtitles) {
-      return res.json({ success: true, message: 'SubDL API is actief!' });
+    if (candidates.length === 0) {
+      return res.json({ subtitles: [] });
     }
-    return res.json({ success: false, error: 'Ongeldige SubDL sleutel' });
-  } catch (err) {
-    return res.json({ success: false, error: 'Verbinding mislukt' });
-  }
-});
 
-app.post('/api/validate/subsource', async (req, res) => {
-  const { apiKey } = req.body;
-  if (!apiKey) return res.json({ success: false, error: 'Key ontbreekt' });
-  const key = apiKey.trim();
-  try {
-    const r = await axios.get('https://api.subsource.net/api/v1/subtitles/recent', {
-      headers: { 'X-API-Key': key, 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' },
-      params: { api_key: key },
-      timeout: 7000
-    });
-    if (r.status === 200) {
-      return res.json({ success: true, message: 'SubSource is actief!' });
-    }
-  } catch (err) {
-    return res.json({ success: false, error: 'SubSource mislukt' });
-  }
-  return res.json({ success: false, error: 'Geen reactie' });
-});
+    const cfgString = Buffer.from(JSON.stringify(config)).toString('base64url');
+    const targetIso3 = config.lang || 'spa';
+    const targetName = config.langName || targetIso3.toUpperCase();
 
-// ================= SUBTITLE BRONNEN ================= //
-
-async function getOpenSubtitlesToken(apiKey, username, password) {
-  if (!apiKey || !username || !password) return null;
-  const cacheKey = `${apiKey.trim()}_${username.trim()}`;
-  const cached = osTokenCache.get(cacheKey);
-  if (cached && Date.now() < cached.expiresAt) return cached.token;
-  try {
-    const res = await axios.post(
-      'https://api.opensubtitles.com/api/v1/login',
-      { username: username.trim(), password: password.trim() },
-      {
-        headers: {
-          'Api-Key': apiKey.trim(),
-          'Content-Type': 'application/json',
-          'User-Agent': 'SubNova-v2.0'
-        },
-        timeout: 5000
+    // Return instant subtitle descriptors pointing to /sub.vtt
+    const subtitles = candidates.slice(0, 2).map((sub, idx) => ({
+      id: `aisubs-${cleanId}-${idx}`,
+      url: `${host}/sub.vtt?cfg=${cfgString}&src=${encodeURIComponent(sub.url)}`,
+      lang: targetIso3,
+      extra: {
+        label: `🤖 AI Subs - ${targetName}${idx > 0 ? ` (#${idx + 1})` : ''}`
       }
-    );
-    if (res.data?.token) {
-      osTokenCache.set(cacheKey, {
-        token: res.data.token,
-        expiresAt: Date.now() + 23 * 3600 * 1000
-      });
-      return res.data.token;
-    }
-  } catch (err) {
-    console.error('[OpenSubtitles] Inlogfout:', err.message);
-  }
-  return null;
-}
-
-async function fetchOpenSubtitlesOfficial(imdbId, season, episode, osApiKey, osUsername, osPassword) {
-  const apiKey = osApiKey || process.env.OPENSUBTITLES_API_KEY;
-  if (!apiKey) return [];
-  const cleanImdb = imdbId ? imdbId.replace(/^tt/, '') : null;
-  if (!cleanImdb) return [];
-
-  try {
-    const token = await getOpenSubtitlesToken(
-      apiKey,
-      osUsername || process.env.OPENSUBTITLES_USERNAME,
-      osPassword || process.env.OPENSUBTITLES_PASSWORD
-    );
-    const headers = { 'Api-Key': apiKey.trim(), 'User-Agent': 'SubNova-v2.0' };
-    if (token) headers.Authorization = `Bearer ${token}`;
-
-    const params = { imdb_id: cleanImdb, languages: 'nl,en' };
-    if (season && episode) {
-      params.season_number = season;
-      params.episode_number = episode;
-      params.type = 'episode';
-    } else {
-      params.type = 'movie';
-    }
-
-    const res = await axios.get('https://api.opensubtitles.com/api/v1/subtitles', {
-      headers,
-      params,
-      timeout: 4500
-    });
-    const list = res.data?.data || [];
-    const results = [];
-    for (const item of list) {
-      const file = item.attributes?.files?.[0];
-      if (!file?.file_id) continue;
-      const lang = item.attributes?.language?.toLowerCase();
-      results.push({
-        source: 'OpenSubtitles VIP',
-        id: `os_v1_${file.file_id}`,
-        fileId: file.file_id,
-        lang: lang === 'nl' || lang === 'dut' ? 'nl' : 'en',
-        release: item.attributes?.release || 'OpenSubtitles Match',
-        osApiKey: apiKey.trim()
-      });
-    }
-    return results;
-  } catch (err) {
-    console.error('[OpenSubtitles official]', err.message);
-    return [];
-  }
-}
-
-async function fetchOpenSubtitlesPublic(type, id, extra) {
-  try {
-    const safeId = encodeURIComponent(id).replace(/%3A/gi, ':');
-    const url = extra
-      ? `https://opensubtitles-v3.strem.io/subtitles/${type}/${safeId}/${encodeURIComponent(extra)}.json`
-      : `https://opensubtitles-v3.strem.io/subtitles/${type}/${safeId}.json`;
-    const res = await axios.get(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      timeout: 4000
-    });
-    return (res.data?.subtitles || []).map((item) => ({
-      source: 'OpenSubtitles',
-      id: item.id,
-      lang:
-        item.lang === 'dut' || item.lang === 'nld' || item.lang === 'nl'
-          ? 'nl'
-          : item.lang === 'eng' || item.lang === 'en'
-            ? 'en'
-            : item.lang,
-      release: String(item.id || 'Gesynchroniseerd'),
-      directUrl: item.url
     }));
+
+    res.json({ subtitles });
   } catch (err) {
-    console.error('[OpenSubtitles public]', err.message);
-    return [];
+    console.error('Error finding source subs:', err.message);
+    res.json({ subtitles: [] });
   }
 }
 
-async function fetchSubDL(imdbId, season, episode, userKey) {
-  const apiKey = userKey || process.env.SUBDL_API_KEY;
-  if (!apiKey) return [];
-  try {
-    const params = {
-      api_key: apiKey.trim(),
-      imdb_id: imdbId,
-      languages: 'NL,EN',
-      type: season ? 'tv' : 'movie'
-    };
-    if (season && episode) {
-      params.season_number = season;
-      params.episode_number = episode;
-    }
-    const res = await axios.get('https://api.subdl.com/api/v1/subtitles', {
-      params,
-      timeout: 4000
-    });
-    return (res.data?.subtitles || []).map((item) => {
-      const l = (item.lang || item.language || '').toLowerCase();
-      return {
-        source: 'SubDL',
-        id: item.url,
-        lang: l.startsWith('nl') || l.startsWith('dut') ? 'nl' : 'en',
-        release: item.release_name || item.name || 'SubDL Match',
-        directUrl: `https://dl.subdl.com${item.url}`
-      };
-    });
-  } catch (err) {
-    console.error('[SubDL]', err.message);
-    return [];
-  }
-}
+app.get('/subtitles/:type/:id', (req, res) => handleSubtitles(req, res, parseConfig('')));
+app.get('/:config/subtitles/:type/:id', (req, res) => handleSubtitles(req, res, parseConfig(req.params.config)));
 
-async function fetchSubSource(imdbId, userKey) {
-  const apiKey = userKey || process.env.SUBSOURCE_API_KEY;
-  if (!apiKey) return [];
-  const key = apiKey.trim();
-  try {
-    const sRes = await axios.get('https://api.subsource.net/api/v1/movies/search', {
-      params: { query: imdbId, api_key: key },
-      headers: { 'X-API-Key': key, 'User-Agent': 'Mozilla/5.0' },
-      timeout: 4500
-    });
-    const movies = sRes.data?.data || sRes.data?.movies || [];
-    const movie = movies[0];
-    if (!movie || !movie.id) return [];
+// ----------------------------------------------------
+// Subtitle Stream & Translation Endpoint (/sub.vtt)
+// ----------------------------------------------------
+app.get('/sub.vtt', async (req, res) => {
+  const { cfg, src } = req.query;
+  const config = parseConfig(cfg);
+  const sourceUrl = decodeURIComponent(src);
 
-    const subRes = await axios.get('https://api.subsource.net/api/v1/subtitles', {
-      params: { movieId: movie.id, lang: 'dutch,english', api_key: key },
-      headers: { 'X-API-Key': key, 'User-Agent': 'Mozilla/5.0' },
-      timeout: 4500
-    });
-    const list = subRes.data?.data || subRes.data?.subtitles || [];
-    return list.map((item) => {
-      const l = (item.lang || '').toLowerCase();
-      return {
-        source: 'SubSource',
-        id: item.id || item.subId,
-        lang: l.includes('dutch') || l === 'nl' ? 'nl' : 'en',
-        release: item.release_name || item.name || 'SubSource Match',
-        downloadUrl: `https://api.subsource.net/api/v1/subtitles/${item.id || item.subId}/download`,
-        apiKey: key
-      };
-    });
-  } catch (err) {
-    console.error('[SubSource]', err.message);
-    return [];
-  }
-}
-
-// ---------- Download helper ----------
-function extractSubtitle(buffer) {
-  try {
-    const zip = new AdmZip(buffer);
-    const entry = zip.getEntries().find((e) => /\.(srt|vtt)$/i.test(e.entryName));
-    if (entry) return decodeText(entry.getData());
-  } catch (e) { /* not a zip */ }
-  return decodeText(buffer);
-}
-
-async function downloadSubtitleText(sub) {
-  const bHeaders = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    Accept: '*/*'
-  };
-
-  if (sub.fileId && sub.osApiKey) {
-    const headers = {
-      'Api-Key': sub.osApiKey,
-      'User-Agent': 'SubNova-v2.0',
-      'Content-Type': 'application/json'
-    };
-    const token = await getOpenSubtitlesToken(
-      sub.osApiKey,
-      sub.osUsername || process.env.OPENSUBTITLES_USERNAME,
-      sub.osPassword || process.env.OPENSUBTITLES_PASSWORD
-    );
-    if (token) headers.Authorization = `Bearer ${token}`;
-    const dlRes = await axios.post(
-      'https://api.opensubtitles.com/api/v1/download',
-      { file_id: sub.fileId },
-      { headers, timeout: 8000 }
-    );
-    if (dlRes.data?.link) {
-      const fRes = await axios.get(dlRes.data.link, {
-        headers: bHeaders,
-        responseType: 'arraybuffer',
-        timeout: 8000
-      });
-      return extractSubtitle(Buffer.from(fRes.data));
-    }
-  }
-
-  if (sub.downloadUrl && sub.apiKey) {
-    const fRes = await axios.get(sub.downloadUrl, {
-      headers: { ...bHeaders, 'X-API-Key': sub.apiKey },
-      params: { api_key: sub.apiKey },
-      responseType: 'arraybuffer',
-      timeout: 8000
-    });
-    return extractSubtitle(Buffer.from(fRes.data));
-  }
-
-  if (sub.directUrl) {
-    const fRes = await axios.get(sub.directUrl, {
-      headers: bHeaders,
-      responseType: 'arraybuffer',
-      timeout: 8000
-    });
-    return extractSubtitle(Buffer.from(fRes.data));
-  }
-
-  return '';
-}
-
-function readPayload(req) {
-  let raw = req.query.d || req.query.data;
-  if (Array.isArray(raw)) raw = raw[0];
-  if (!raw) {
-    console.error('[payload] geen d-parameter');
-    return null;
-  }
-  raw = String(raw).trim().replace(/ /g, '+');
-  try {
-    return decryptPayload(raw);
-  } catch (e) {
-    console.error('[payload] ontsleutelen mislukt:', e.message, '| lengte:', raw.length);
-    return null;
-  }
-}
-
-function sendVtt(res, body, cache) {
   res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', cache || 'no-store');
-  res.send(body);
+
+  const cacheKey = `${sourceUrl}_${config.lang}_${config.provider}_${config.offsetMs}_${config.bilingual}`;
+  if (subCache.has(cacheKey)) {
+    return res.send(subCache.get(cacheKey));
+  }
+
+  try {
+    const subRes = await fetch(sourceUrl, { signal: AbortSignal.timeout(6000) });
+    if (!subRes.ok) throw new Error(`Failed to download raw subtitle: ${subRes.status}`);
+    const rawText = await subRes.text();
+
+    const cues = parseSubtitleCues(rawText);
+    if (!cues || cues.length === 0) {
+      throw new Error('Unable to parse subtitle cues');
+    }
+
+    // Apply timing offset if requested
+    if (config.offsetMs && config.offsetMs !== 0) {
+      cues.forEach(c => {
+        c.start = shiftTimestamp(c.start, config.offsetMs);
+        c.end = shiftTimestamp(c.end, config.offsetMs);
+      });
+    }
+
+    // Translate cues in batches of 40 lines
+    const batchSize = 40;
+    for (let i = 0; i < cues.length; i += batchSize) {
+      const chunk = cues.slice(i, i + batchSize);
+      const textsToTranslate = chunk.map(c => c.text);
+      const translated = await translateBatch(textsToTranslate, config.langName || 'Spanish', config);
+
+      chunk.forEach((c, idx) => {
+        const trans = translated[idx] || c.text;
+        c.text = config.bilingual ? `${c.text}\n<c.cyan>${trans}</c>` : trans;
+      });
+    }
+
+    const vttOutput = buildWebVTT(cues);
+    setInCache(cacheKey, vttOutput);
+    res.send(vttOutput);
+  } catch (err) {
+    console.error('Translation error:', err.message);
+    res.send('WEBVTT\n\n1\n00:00:01.000 --> 00:00:05.000\n[AISubs: Translation unavailable or timed out]');
+  }
+});
+
+// ----------------------------------------------------
+// Translation Routing
+// ----------------------------------------------------
+async function translateBatch(texts, targetLang, config) {
+  const { provider, apiKey, model } = config;
+
+  if (provider === 'gemini' && apiKey) {
+    return translateWithGemini(texts, targetLang, apiKey, model);
+  }
+  if ((provider === 'openrouter' || provider === 'openai' || provider === 'groq' || provider === 'deepseek') && apiKey) {
+    return translateWithOpenAICompatible(texts, targetLang, provider, apiKey, model);
+  }
+  return translateWithFreeFallback(texts, targetLang);
 }
 
-const message = (text) =>
-  `WEBVTT\n\n00:00:01.000 --> 00:00:10.000\n${text}\n\n`;
+// 1. Google Gemini
+async function translateWithGemini(texts, targetLang, apiKey, model) {
+  const chosenModel = model && model !== 'default' ? model : 'gemini-2.0-flash';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${chosenModel}:generateContent?key=${apiKey}`;
 
-// ---------- Configuration page ----------
-const path = require('path');
-app.get(['/', '/configure', '/:config/configure'], (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
-});
+  const prompt = `Translate each line of the following numbered list to ${targetLang}. Preserve line numbers strictly. Return ONLY the translated numbered list, with no intro, markdown formatting, or outro:\n\n${texts.map((t, idx) => `${idx + 1}. ${t.replace(/\n/g, ' ')}`).join('\n')}`;
 
-// ================= STREMIO ROUTES ================= //
-
-app.get(['/manifest.json', '/:config/manifest.json'], (req, res) => {
-  // Make sure the fields Stremio/Nuvio require are always present
-  const out = {
-    catalogs: [],
-    ...manifest,
-    resources: manifest.resources || ['subtitles'],
-    types: manifest.types || ['movie', 'series'],
-    idPrefixes: manifest.idPrefixes || ['tt']
-  };
-  if (!Array.isArray(out.catalogs)) out.catalogs = [];
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-store');
-  res.json(out);
-});
-
-app.get([
-  '/subtitles/:type/:id.json',
-  '/subtitles/:type/:id/:extra.json',
-  '/:config/subtitles/:type/:id.json',
-  '/:config/subtitles/:type/:id/:extra.json'
-], async (req, res) => {
-  const { type, extra, config: rawConfig } = req.params;
-  const id = decodeURIComponent(req.params.id || '');
-  const config = parseConfig(rawConfig);
-  const host = getHost(req);
-
-  let imdbId = id;
-  let season = null;
-  let episode = null;
-  if (id.includes(':')) {
-    const parts = id.split(':');
-    imdbId = parts[0];
-    season = parts[1];
-    episode = parts[2];
-  }
-
-  const [osOfficial, pubSubs, dlSubs, ssSubs] = await Promise.allSettled([
-    withTimeout(fetchOpenSubtitlesOfficial(
-      imdbId, season, episode, config.osApiKey, config.osUsername, config.osPassword
-    )),
-    withTimeout(fetchOpenSubtitlesPublic(type, id, extra)),
-    withTimeout(fetchSubDL(imdbId, season, episode, config.subdlKey)),
-    withTimeout(fetchSubSource(imdbId, config.subsourceKey))
-  ]);
-
-  const val = (r) => (r.status === 'fulfilled' && Array.isArray(r.value) ? r.value : []);
-  const allSubs = [...val(osOfficial), ...val(pubSubs), ...val(dlSubs), ...val(ssSubs)];
-
-  const nlSubs = allSubs.filter((s) => s.lang === 'nl');
-  const enSubs = allSubs.filter((s) => s.lang === 'en');
-
-  const subtitles = [];
-
-  // 1. AI NL translation of the best English sub
-  if (enSubs.length > 0) {
-    const bestEn = enSubs[0];
-    const payload = encryptPayload({
-      fileId: bestEn.fileId,
-      osApiKey: bestEn.osApiKey,
-      osUsername: config.osUsername,
-      osPassword: config.osPassword,
-      downloadUrl: bestEn.downloadUrl,
-      apiKey: bestEn.apiKey,
-      directUrl: bestEn.directUrl,
-      mediaId: id,
-      geminiKey: config.geminiKey,
-      geminiModel: config.geminiModel
-    });
-    const labelTitle = (bestEn.release || 'Sync').slice(0, 25);
-    // Pre-warm: start translating now, so it is (nearly) ready when the user picks it
-    if (config.geminiKey || process.env.GEMINI_API_KEY) {
-      startTranslation({
-        fileId: bestEn.fileId,
-        osApiKey: bestEn.osApiKey,
-        osUsername: config.osUsername,
-        osPassword: config.osPassword,
-        downloadUrl: bestEn.downloadUrl,
-        apiKey: bestEn.apiKey,
-        directUrl: bestEn.directUrl,
-        mediaId: id,
-        geminiKey: config.geminiKey,
-        geminiModel: config.geminiModel
-      });
-    } else {
-      console.warn('[config] Geen Gemini key: AI vertaling uitgeschakeld');
-    }
-    subtitles.push({
-      id: 'ai_nl_sync_top',
-      url: `${host}/sub/translate.vtt?d=${payload}`,
-      lang: 'dut',
-      label: `⭐ [AI NL • Gesynchroniseerd] (${labelTitle})`
-    });
-  }
-
-  // 2. Existing Dutch subs, always proxied so they are valid https WebVTT
-  nlSubs.forEach((sub, idx) => {
-    const payload = encryptPayload({
-      fileId: sub.fileId,
-      osApiKey: sub.osApiKey,
-      osUsername: config.osUsername,
-      osPassword: config.osPassword,
-      downloadUrl: sub.downloadUrl,
-      apiKey: sub.apiKey,
-      directUrl: sub.directUrl
-    });
-    const cleanSrc = sub.source.replace(/\s+/g, '_');
-    subtitles.push({
-      id: `nl_${cleanSrc}_${idx}`,
-      url: `${host}/sub/stream.vtt?d=${payload}`,
-      lang: 'dut',
-      label: `[${sub.source}] ${(sub.release || 'NL').slice(0, 30)}`
-    });
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.1 }
+    }),
+    signal: AbortSignal.timeout(10000)
   });
 
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  // Never let clients cache an empty result (cold start / timeout)
-  res.setHeader(
-    'Cache-Control',
-    subtitles.length ? 'max-age=1800, stale-while-revalidate=86400' : 'no-store'
-  );
-  res.json({ subtitles });
-});
+  const data = await res.json();
+  const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  return parseNumberedReply(reply, texts);
+}
 
-// ================= STREAM PROXY ================= //
+// 2. OpenAI / OpenRouter / Groq / DeepSeek
+async function translateWithOpenAICompatible(texts, targetLang, provider, apiKey, model) {
+  let endpoint = 'https://api.openai.com/v1/chat/completions';
+  let defaultModel = 'gpt-4o-mini';
 
-app.get(['/sub/stream', '/sub/stream.vtt'], async (req, res) => {
-  try {
-    const sub = readPayload(req);
-    if (!sub) return sendVtt(res.status(400), message('Ongeldige link'));
-    const rawText = await downloadSubtitleText(sub);
-    sendVtt(res, srtToVtt(rawText), 'public, max-age=86400');
-  } catch (err) {
-    console.error('[stream]', err.message);
-    sendVtt(res, message('Fout bij laden'));
+  if (provider === 'openrouter') {
+    endpoint = 'https://openrouter.ai/api/v1/chat/completions';
+    defaultModel = 'google/gemini-2.0-flash-001';
+  } else if (provider === 'groq') {
+    endpoint = 'https://api.groq.com/openai/v1/chat/completions';
+    defaultModel = 'llama-3.3-70b-versatile';
+  } else if (provider === 'deepseek') {
+    endpoint = 'https://api.deepseek.com/chat/completions';
+    defaultModel = 'deepseek-chat';
   }
-});
 
-// ================= TRANSLATE ================= //
+  const chosenModel = model && model !== 'default' ? model : defaultModel;
 
-async function getCached(cacheKey) {
-  if (db) {
+  const prompt = `Translate each line to ${targetLang}. Return ONLY the numbered lines with no quotes, notes, or code blocks:\n\n${texts.map((t, idx) => `${idx + 1}. ${t.replace(/\n/g, ' ')}`).join('\n')}`;
+
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: chosenModel,
+      temperature: 0.1,
+      messages: [{ role: 'user', content: prompt }]
+    }),
+    signal: AbortSignal.timeout(10000)
+  });
+
+  const data = await res.json();
+  const reply = data.choices?.[0]?.message?.content || '';
+  return parseNumberedReply(reply, texts);
+}
+
+// 3. Free Web Fallback (Zero Setup / Keyless)
+async function translateWithFreeFallback(texts, targetLang) {
+  const results = [];
+  for (const text of texts) {
     try {
-      const doc = await db.collection('translations').findOne({ cacheKey });
-      if (doc?.vtt) return doc.vtt;
-    } catch (e) {
-      console.error('[Mongo read]', e.message);
+      const clean = encodeURIComponent(text);
+      const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${targetLang.slice(0, 2).toLowerCase()}&dt=t&q=${clean}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(2500) });
+      const json = await res.json();
+      const translated = json[0]?.map(p => p[0]).join('') || text;
+      results.push(translated);
+    } catch {
+      results.push(text);
     }
   }
-  return memCache.get(cacheKey) || null;
+  return results;
 }
 
-async function saveCached(cacheKey, vtt) {
-  memCache.set(cacheKey, vtt);
-  if (memCache.size > 50) memCache.delete(memCache.keys().next().value);
-  if (db) {
-    try {
-      await db.collection('translations').updateOne(
-        { cacheKey },
-        { $set: { cacheKey, vtt, updatedAt: new Date() } },
-        { upsert: true }
-      );
-    } catch (e) {
-      console.error('[Mongo write]', e.message);
+// Parse AI numbered lines
+function parseNumberedReply(reply, original) {
+  const lines = reply.split('\n').filter(l => l.trim().length > 0);
+  const map = new Map();
+  for (const line of lines) {
+    const match = line.match(/^(\d+)[\.\:\)]\s*(.*)$/);
+    if (match) {
+      map.set(parseInt(match[1], 10), match[2].trim());
     }
   }
+  return original.map((orig, idx) => map.get(idx + 1) || orig);
 }
 
-function cacheKeyFor(data) {
-  const rawSrc = data.directUrl || data.downloadUrl || String(data.fileId || '');
-  const shortHash = crypto.createHash('sha1').update(rawSrc).digest('hex').slice(0, 16);
-  return `ai_nl_${data.mediaId || 'video'}_${shortHash}`;
-}
+// Subtitle Parsers & Builders
+function parseSubtitleCues(raw) {
+  const lines = raw.replace(/\r\n/g, '\n').split('\n');
+  const cues = [];
+  let i = 0;
+  const timeRegex = /(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})/;
 
-async function runTranslation(cacheKey, data) {
-  console.log(`[translate] start ${cacheKey}`);
-  const rawSrt = await downloadSubtitleText(data);
-  if (!rawSrt || !rawSrt.includes('-->')) throw new Error('Bron-ondertitel is leeg of niet gedownload');
-  const translated = await translateFullSrtWithGemini(rawSrt, data.geminiKey, data.geminiModel);
-  await saveCached(cacheKey, srtToVtt(translated));
-  console.log(`✅ Vertaling klaar: ${cacheKey}`);
-}
-
-// Starts a job once; returns the running promise
-function startTranslation(data) {
-  const cacheKey = cacheKeyFor(data);
-  const failUntil = failed.get(cacheKey);
-  if (failUntil && Date.now() < failUntil) return { cacheKey, job: null };
-  if (!inflight.has(cacheKey)) {
-    const job = (async () => {
-      if (await getCached(cacheKey)) return;
-      await runTranslation(cacheKey, data);
-    })()
-      .catch((err) => {
-        console.error('[translate job] mislukt:', err.message);
-        failed.set(cacheKey, Date.now() + 5 * 60 * 1000);
-      })
-      .finally(() => inflight.delete(cacheKey));
-    inflight.set(cacheKey, job);
-  }
-  return { cacheKey, job: inflight.get(cacheKey) };
-}
-
-app.get(['/sub/translate', '/sub/translate.vtt'], async (req, res) => {
-  try {
-    const data = readPayload(req);
-    if (!data) return sendVtt(res.status(400), message('Ongeldige link'));
-
-    const cacheKey = cacheKeyFor(data);
-    let cached = await getCached(cacheKey);
-    if (cached) return sendVtt(res, cached, 'public, max-age=86400');
-
-    const failUntil = failed.get(cacheKey);
-    if (failUntil && Date.now() < failUntil) {
-      return sendVtt(res, message('AI vertaling mislukt. Controleer je Gemini key en probeer later opnieuw'));
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    const match = timeRegex.exec(line);
+    if (match) {
+      const start = match[1].replace(',', '.');
+      const end = match[2].replace(',', '.');
+      i++;
+      const textLines = [];
+      while (i < lines.length && lines[i].trim() !== '') {
+        textLines.push(lines[i].trim());
+        i++;
+      }
+      cues.push({ start, end, text: textLines.join('\n') });
+    } else {
+      i++;
     }
-
-    // Start (or join) the job and wait up to 25s, so most requests get the real file
-    const { job } = startTranslation(data);
-    if (job) await Promise.race([job, sleep(25000)]);
-
-    cached = await getCached(cacheKey);
-    if (cached) return sendVtt(res, cached, 'public, max-age=86400');
-
-    if (failed.get(cacheKey) > Date.now()) {
-      return sendVtt(res, message('AI vertaling mislukt. Controleer je Gemini key en probeer later opnieuw'));
-    }
-    return sendVtt(res, message('AI vertaling bezig... Selecteer deze ondertitel over 1 minuut opnieuw'));
-  } catch (err) {
-    console.error('[translate]', err.message);
-    sendVtt(res, message('Fout bij vertalen'));
   }
-});
+  return cues;
+}
 
-// Health check (also useful for a keep-alive ping on Render)
-app.get('/health', (req, res) => res.send('ok'));
+function buildWebVTT(cues) {
+  let vtt = 'WEBVTT\n\n';
+  cues.forEach((cue, idx) => {
+    vtt += `${idx + 1}\n${cue.start} --> ${cue.end}\n${cue.text}\n\n`;
+  });
+  return vtt;
+}
+
+function shiftTimestamp(ts, offsetMs) {
+  const parts = ts.split(':');
+  const h = parseInt(parts[0], 10);
+  const m = parseInt(parts[1], 10);
+  const [sStr, msStr] = parts[2].split('.');
+  const s = parseInt(sStr, 10);
+  const ms = parseInt(msStr, 10);
+
+  let totalMs = ((h * 3600 + m * 60 + s) * 1000) + ms + offsetMs;
+  if (totalMs < 0) totalMs = 0;
+
+  const newH = Math.floor(totalMs / 3600000);
+  totalMs %= 3600000;
+  const newM = Math.floor(totalMs / 60000);
+  totalMs %= 60000;
+  const newS = Math.floor(totalMs / 1000);
+  const newMs = totalMs % 1000;
+
+  return `${String(newH).padStart(2, '0')}:${String(newM).padStart(2, '0')}:${String(newS).padStart(2, '0')}.${String(newMs).padStart(3, '0')}`;
+}
+
+// Health check endpoint
+app.get('/health', (req, res) => res.json({ status: 'ok', version: '1.2.0' }));
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 SubNova draait op poort ${PORT} | Gemini env: ${!!process.env.GEMINI_API_KEY} | Mongo: ${!!process.env.MONGODB_URI} | PUBLIC_URL: ${process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || 'n/a'}`);
+  console.log(`AISUBS server running on port ${PORT}`);
 });
