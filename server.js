@@ -2,20 +2,20 @@ import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
+import zlib from 'zlib';
 import { getManifest } from './manifest.js';
 
 const app = express();
 const PORT = process.env.PORT || 7860;
 
-// Default environment overrides (like Guy-Builds and SubtitleSync)
 const ENV_GEMINI_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
-const ENV_TARGET_LANG = process.env.TARGET_LANG || 'nld'; // Default to Dutch
+const ENV_TARGET_LANG = process.env.TARGET_LANG || 'nld';
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 app.use(express.static('.'));
 
-// Persistent Profile Storage (saved on disk/memory for TV short URLs)
+// Persistent Profiles
 const PROFILES_FILE = path.join(process.cwd(), 'profiles.json');
 let savedProfiles = {};
 if (fs.existsSync(PROFILES_FILE)) {
@@ -30,7 +30,7 @@ function persistProfiles() {
   try {
     fs.writeFileSync(PROFILES_FILE, JSON.stringify(savedProfiles, null, 2));
   } catch (e) {
-    console.warn('[AISUBS] Could not persist profiles to disk:', e.message);
+    console.warn('[AISUBS] Could not write profiles.json:', e.message);
   }
 }
 
@@ -66,23 +66,13 @@ function parseConfig(raw) {
   };
 
   if (!raw) return baseDefault;
+  if (savedProfiles[raw]) return { ...baseDefault, ...savedProfiles[raw] };
 
-  // Check saved server profiles (e.g. /p/living-room/manifest.json)
-  if (savedProfiles[raw]) {
-    return { ...baseDefault, ...savedProfiles[raw] };
-  }
-
-  // 3-letter language code (e.g. /nld/manifest.json)
   if (/^[a-z]{3}$/i.test(raw)) {
     const code = raw.toLowerCase();
-    return {
-      ...baseDefault,
-      lang: code,
-      langName: ISO_LANG_MAP[code] || code.toUpperCase()
-    };
+    return { ...baseDefault, lang: code, langName: ISO_LANG_MAP[code] || code.toUpperCase() };
   }
 
-  // Base64 or JSON config
   try {
     const json = Buffer.from(raw, 'base64url').toString('utf-8');
     const parsed = JSON.parse(json);
@@ -98,7 +88,7 @@ function parseConfig(raw) {
 }
 
 // ----------------------------------------------------
-// Profile Server Endpoints (for TV & Multi-Device Sync)
+// Profile Storage Endpoints
 // ----------------------------------------------------
 app.post('/api/profiles/save', (req, res) => {
   const { name, config } = req.body;
@@ -126,7 +116,7 @@ app.get(['/manifest.json', '/p/:profile/manifest.json', '/:param/manifest.json']
 });
 
 // ----------------------------------------------------
-// Credential Verification Endpoints
+// Verification Endpoints
 // ----------------------------------------------------
 app.post('/api/verify-opensubtitles', async (req, res) => {
   const { apiKey, username, password } = req.body;
@@ -136,10 +126,10 @@ app.post('/api/verify-opensubtitles', async (req, res) => {
     const testRes = await fetch('https://api.opensubtitles.com/api/v1/subtitles?imdb_id=0111161&languages=en', {
       headers: {
         'Api-Key': apiKey,
-        'User-Agent': 'AISUBS v2.0.0',
+        'User-Agent': 'AISUBS v2.1.0',
         'Accept': 'application/json'
       },
-      signal: AbortSignal.timeout(6000)
+      signal: AbortSignal.timeout(7000)
     });
 
     if (testRes.status === 401 || testRes.status === 403) {
@@ -151,12 +141,12 @@ app.post('/api/verify-opensubtitles', async (req, res) => {
         method: 'POST',
         headers: {
           'Api-Key': apiKey,
-          'User-Agent': 'AISUBS v2.0.0',
+          'User-Agent': 'AISUBS v2.1.0',
           'Content-Type': 'application/json',
           'Accept': 'application/json'
         },
         body: JSON.stringify({ username, password }),
-        signal: AbortSignal.timeout(6000)
+        signal: AbortSignal.timeout(7000)
       });
       const loginData = await loginRes.json();
       if (loginRes.ok && (loginData.token || loginData.status === 200)) {
@@ -176,7 +166,7 @@ app.post('/api/verify-subdl', async (req, res) => {
   if (!apiKey) return res.status(400).json({ valid: false, error: 'API Key is required' });
   try {
     const resp = await fetch(`https://api.subdl.com/api/v1/subtitles?api_key=${apiKey}&imdb_id=tt0111161&languages=en&subs_per_page=1`, {
-      signal: AbortSignal.timeout(6000)
+      signal: AbortSignal.timeout(7000)
     });
     const data = await resp.json();
     if (resp.ok && data.status !== false) return res.json({ valid: true });
@@ -186,16 +176,34 @@ app.post('/api/verify-subdl', async (req, res) => {
   }
 });
 
+// Fixed SubSource verification endpoint with correct headers and fallback query
 app.post('/api/verify-subsource', async (req, res) => {
   const { apiKey } = req.body;
   if (!apiKey) return res.status(400).json({ valid: false, error: 'API Key is required' });
+
+  const headers = {
+    'X-API-Key': apiKey.trim(),
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json'
+  };
+
   try {
-    const resp = await fetch('https://api.subsource.net/api/v1/movies/search?query=Inception', {
-      headers: { 'X-API-Key': apiKey },
-      signal: AbortSignal.timeout(6000)
+    // 1. Test against /subtitles/recent
+    const resp = await fetch('https://api.subsource.net/api/v1/subtitles/recent', {
+      headers,
+      signal: AbortSignal.timeout(7000)
     });
     if (resp.ok) return res.json({ valid: true });
-    return res.status(400).json({ valid: false, error: `Invalid Key (HTTP ${resp.status})` });
+
+    // 2. Fallback test against /movies/search?searchType=text&q=Inception
+    const searchResp = await fetch('https://api.subsource.net/api/v1/movies/search?searchType=text&q=Inception', {
+      headers,
+      signal: AbortSignal.timeout(7000)
+    });
+    if (searchResp.ok) return res.json({ valid: true });
+
+    const status = resp.status !== 404 ? resp.status : searchResp.status;
+    return res.status(400).json({ valid: false, error: `Verification failed (HTTP ${status})` });
   } catch (err) {
     return res.status(500).json({ valid: false, error: err.message });
   }
@@ -236,12 +244,11 @@ app.post('/api/verify-ai', async (req, res) => {
 });
 
 // ----------------------------------------------------
-// SubtitleSync Backend Engine: Auto-Sync via Reference Match
+// Subtitle Discovery & Auto-Sync Engine
 // ----------------------------------------------------
 app.use(async (req, res, next) => {
   if (!req.path.includes('/subtitles/')) return next();
 
-  // Pattern matches /[:config]/subtitles/:type/:id/:extra?
   const match = req.path.match(/(?:^|\/)(?:p\/([^/]+)|([^/]+))?\/subtitles\/(movie|series)\/([a-zA-Z0-9:]+)(?:\/(.*))?/);
   if (!match) return next();
 
@@ -253,7 +260,6 @@ app.use(async (req, res, next) => {
   const config = parseConfig(profileOrConfig);
   const host = `${req.protocol}://${req.get('host')}`;
 
-  // Parse extra arguments (videoHash, videoSize, filename)
   const extraParams = {};
   if (extraStr) {
     extraStr.split('&').forEach(part => {
@@ -268,15 +274,15 @@ app.use(async (req, res, next) => {
   const season = parts[1] || null;
   const episode = parts[2] || null;
 
-  console.log(`\n[AISUBS-SYNC] Query: ${mediaType} ${fullId} | Hash: ${videoHash || 'None'} | File: ${filename || 'None'}`);
+  console.log(`\n[AISUBS-DISCOVERY] ${mediaType} ${fullId} | Hash: ${videoHash || 'None'} | File: ${filename || 'None'}`);
 
-  let nativeMatchedSubs = [];
   let referenceEnSubs = [];
+  let nativeTargetSubs = [];
 
   const targetIso3 = config.lang || 'nld';
   const targetIso1 = targetIso3 === 'nld' ? 'nl' : targetIso3.slice(0, 2);
 
-  // 1. OpenSubtitles API with Hash matching
+  // 1. OpenSubtitles API with Hash Matching
   if (config.osApiKey) {
     try {
       let osUrl = `https://api.opensubtitles.com/api/v1/subtitles?imdb_id=${imdbId.replace('tt', '')}&languages=${targetIso1},en`;
@@ -286,7 +292,7 @@ app.use(async (req, res, next) => {
       const osRes = await fetch(osUrl, {
         headers: {
           'Api-Key': config.osApiKey,
-          'User-Agent': 'AISUBS v2.0.0',
+          'User-Agent': 'AISUBS v2.1.0',
           'Accept': 'application/json'
         },
         signal: AbortSignal.timeout(3500)
@@ -308,22 +314,18 @@ app.use(async (req, res, next) => {
                 isHashMatch,
                 url: `https://api.opensubtitles.com/api/v1/download?file_id=${fileId}&osApiKey=${config.osApiKey}`
               };
-
-              if (langCode === targetIso1) {
-                nativeMatchedSubs.push(subObj);
-              } else if (langCode === 'en') {
-                referenceEnSubs.push(subObj);
-              }
+              if (langCode === targetIso1) nativeTargetSubs.push(subObj);
+              else if (langCode === 'en') referenceEnSubs.push(subObj);
             }
           });
         }
       }
     } catch (e) {
-      console.warn('[AISUBS-SYNC] OpenSubtitles query error:', e.message);
+      console.warn('[AISUBS] OpenSubtitles error:', e.message);
     }
   }
 
-  // 2. OpenSubtitles v3 proxy (Forwarding hash & filename)
+  // 2. OpenSubtitles v3 Public Proxy (Forwards exact hash & extra)
   if (referenceEnSubs.length === 0) {
     try {
       let pubUrl = `https://opensubtitles-v3.strem.io/subtitles/${mediaType}/${fullId}`;
@@ -331,7 +333,7 @@ app.use(async (req, res, next) => {
       pubUrl += '.json';
 
       const pubRes = await fetch(pubUrl, {
-        headers: { 'User-Agent': 'AISubs/2.0.0' },
+        headers: { 'User-Agent': 'AISubs/2.1.0' },
         signal: AbortSignal.timeout(3500)
       });
 
@@ -344,22 +346,21 @@ app.use(async (req, res, next) => {
 
             const subObj = {
               source: 'OpenSubtitles-v3',
-              release: filename || 'Exact Video File',
+              release: filename || 'Synced Video File',
               isHashMatch: !!videoHash,
               url: s.url
             };
-
-            if (isTarget) nativeMatchedSubs.push(subObj);
+            if (isTarget) nativeTargetSubs.push(subObj);
             else if (isEnglish) referenceEnSubs.push(subObj);
           });
         }
       }
     } catch (e) {
-      console.warn('[AISUBS-SYNC] OpenSubtitles v3 proxy error:', e.message);
+      console.warn('[AISUBS] OpenSubtitles v3 error:', e.message);
     }
   }
 
-  // 3. SubDL API
+  // 3. SubDL API (Fallback)
   if (referenceEnSubs.length === 0 && config.subdlApiKey) {
     try {
       let subdlUrl = `https://api.subdl.com/api/v1/subtitles?api_key=${config.subdlApiKey}&imdb_id=${imdbId}&languages=EN,${targetIso1.toUpperCase()}&subs_per_page=4`;
@@ -377,13 +378,13 @@ app.use(async (req, res, next) => {
               isHashMatch: false,
               url: fullUrl
             };
-            if (s.lang?.toLowerCase() === targetIso1) nativeMatchedSubs.push(subObj);
+            if (s.lang?.toLowerCase() === targetIso1) nativeTargetSubs.push(subObj);
             else referenceEnSubs.push(subObj);
           });
         }
       }
     } catch (e) {
-      console.warn('[AISUBS-SYNC] SubDL query error:', e.message);
+      console.warn('[AISUBS] SubDL error:', e.message);
     }
   }
 
@@ -391,19 +392,7 @@ app.use(async (req, res, next) => {
   const targetName = config.langName || 'Dutch';
   const outSubtitles = [];
 
-  // A. If an exact hash-matched subtitle in the target language exists, put it on top
-  if (nativeMatchedSubs.length > 0) {
-    const topNative = nativeMatchedSubs[0];
-    outSubtitles.push({
-      id: `aisubs-native-0`,
-      url: topNative.url,
-      lang: targetIso3,
-      label: `✓ Synced to Video · ${topNative.source} · ${topNative.release}`
-    });
-  }
-
-  // B. Auto-Sync AI Translation of the hash-matched reference subtitle
-  // (Following subtitlesync.stream: translate the hash-synced English subtitle so the timing aligns with the video)
+  // Track 1: Hash-synced reference subtitle translated with AI
   if (referenceEnSubs.length > 0) {
     const refSub = referenceEnSubs[0];
     const syncBadge = refSub.isHashMatch ? '✓ Synced' : '⏳ Auto-Sync';
@@ -426,24 +415,172 @@ app.use(async (req, res, next) => {
     }
   }
 
+  // Track 2: Native target language subtitle (if exact match exists)
+  if (nativeTargetSubs.length > 0) {
+    const topNative = nativeTargetSubs[0];
+    outSubtitles.push({
+      id: `aisubs-native-0`,
+      url: `${host}/sub.vtt?cfg=${cfgString}&src=${encodeURIComponent(topNative.url)}&raw=true`,
+      lang: targetIso3,
+      label: `✓ Synced Native · ${topNative.source} · ${topNative.release}`
+    });
+  }
+
   res.setHeader('Access-Control-Allow-Origin', '*');
   return res.json({ subtitles: outSubtitles });
 });
 
 // ----------------------------------------------------
-// Subtitle Stream & Translation Engine (/sub.vtt)
+// Decompression Engine (Handles GZIP, ZIP archives, and raw encodings)
+// ----------------------------------------------------
+function decompressSubtitleBuffer(buffer) {
+  // 1. Gzip Stream (Magic bytes 0x1f 0x8b)
+  if (buffer.length > 2 && buffer[0] === 0x1f && buffer[1] === 0x8b) {
+    try {
+      const decomp = zlib.gunzipSync(buffer);
+      return decodeText(decomp);
+    } catch (e) {
+      console.warn('[AISUBS] Gunzip failed, attempting inflateRaw:', e.message);
+      try {
+        const decomp = zlib.inflateRawSync(buffer.slice(10));
+        return decodeText(decomp);
+      } catch (err) {}
+    }
+  }
+
+  // 2. PKZip Archive (Magic bytes 'PK\x03\x04')
+  if (buffer.length > 4 && buffer[0] === 0x50 && buffer[1] === 0x4b && buffer[2] === 0x03 && buffer[3] === 0x04) {
+    try {
+      let offset = 0;
+      while (offset < buffer.length - 30) {
+        if (buffer[offset] !== 0x50 || buffer[offset + 1] !== 0x4b || buffer[offset + 2] !== 0x03 || buffer[offset + 3] !== 0x04) {
+          break;
+        }
+        const compMethod = buffer.readUInt16LE(offset + 8);
+        const compSize = buffer.readUInt32LE(offset + 18);
+        const fnameLen = buffer.readUInt16LE(offset + 26);
+        const extraLen = buffer.readUInt16LE(offset + 28);
+        const fnameStart = offset + 30;
+        const fname = buffer.slice(fnameStart, fnameStart + fnameLen).toString('utf-8');
+        const dataStart = fnameStart + fnameLen + extraLen;
+        const dataEnd = dataStart + compSize;
+        const fileBytes = buffer.slice(dataStart, dataEnd);
+
+        if (fname.endsWith('.srt') || fname.endsWith('.vtt') || fname.endsWith('.ass') || fname.endsWith('.sub') || !fname.includes('.')) {
+          if (compMethod === 0) {
+            return decodeText(fileBytes);
+          } else if (compMethod === 8) {
+            const decomp = zlib.inflateRawSync(fileBytes);
+            return decodeText(decomp);
+          }
+        }
+        offset = dataEnd;
+      }
+    } catch (e) {
+      console.warn('[AISUBS] Zip decompression error:', e.message);
+    }
+  }
+
+  return decodeText(buffer);
+}
+
+function decodeText(buffer) {
+  const utf8 = buffer.toString('utf-8');
+  if (!utf8.includes('\uFFFD')) return utf8;
+  return buffer.toString('latin1');
+}
+
+// ----------------------------------------------------
+// Universal Cue Parser (SRT, WebVTT, ASS/SSA)
+// ----------------------------------------------------
+function parseSubtitleCues(raw) {
+  const clean = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
+  const cues = [];
+
+  // Check for ASS / SSA script events
+  if (clean.includes('[Events]') && clean.includes('Dialogue:')) {
+    const lines = clean.split('\n');
+    for (const line of lines) {
+      if (line.startsWith('Dialogue:')) {
+        const parts = line.split(',');
+        if (parts.length >= 10) {
+          const start = padAssTime(parts[1].trim());
+          const end = padAssTime(parts[2].trim());
+          const text = parts.slice(9).join(',').replace(/\\N/g, '\n').replace(/\{.*?\}/g, '').trim();
+          if (text) cues.push({ start, end, text });
+        }
+      }
+    }
+    if (cues.length > 0) return cues;
+  }
+
+  // Regex matches 1 or 2 digit hours with comma or period decimals
+  const timeRegex = /(\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3})/;
+  const lines = clean.split('\n');
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    const match = timeRegex.exec(line);
+    if (match) {
+      const start = normalizeTimestamp(match[1]);
+      const end = normalizeTimestamp(match[2]);
+      i++;
+      const textLines = [];
+      while (i < lines.length && lines[i].trim() !== '') {
+        const textLine = lines[i].trim();
+        // Skip WebVTT cue settings or cue numbers
+        if (!textLine.includes('-->')) textLines.push(textLine);
+        i++;
+      }
+      if (textLines.length > 0) {
+        cues.push({ start, end, text: textLines.join('\n') });
+      }
+    } else {
+      i++;
+    }
+  }
+
+  return cues;
+}
+
+function normalizeTimestamp(ts) {
+  const clean = ts.replace(',', '.');
+  const parts = clean.split(':');
+  if (parts.length === 3) {
+    const h = parts[0].padStart(2, '0');
+    const m = parts[1].padStart(2, '0');
+    const [s, ms = '000'] = parts[2].split('.');
+    return `${h}:${m}:${s.padStart(2, '0')}.${ms.padEnd(3, '0').slice(0, 3)}`;
+  }
+  return clean;
+}
+
+function padAssTime(t) {
+  const parts = t.split(':');
+  if (parts.length === 3) {
+    const h = parts[0].padStart(2, '0');
+    const m = parts[1].padStart(2, '0');
+    const [s, cs = '00'] = parts[2].split('.');
+    return `${h}:${m}:${s.padStart(2, '0')}.${(parseInt(cs, 10) * 10).toString().padStart(3, '0')}`;
+  }
+  return t;
+}
+
+// ----------------------------------------------------
+// Subtitle Stream & Translation Delivery (/sub.vtt)
 // ----------------------------------------------------
 app.get('/sub.vtt', async (req, res) => {
-  const { cfg, src, synced } = req.query;
+  const { cfg, src, raw } = req.query;
   const config = parseConfig(cfg);
   let sourceUrl = decodeURIComponent(src);
 
   res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
   res.setHeader('Access-Control-Allow-Origin', '*');
 
-  console.log(`\n[AISUBS] Requested Subtitle Stream for Language: ${config.langName} (${config.lang})`);
+  console.log(`\n[AISUBS-RENDER] Request for ${config.langName} (${config.lang})`);
 
-  // Handle OpenSubtitles download resolution
+  // Resolve OpenSubtitles direct download link
   if (sourceUrl.includes('api.opensubtitles.com/api/v1/download')) {
     try {
       const u = new URL(sourceUrl);
@@ -453,7 +590,7 @@ app.get('/sub.vtt', async (req, res) => {
         method: 'POST',
         headers: {
           'Api-Key': apiKey,
-          'User-Agent': 'AISUBS v2.0.0',
+          'User-Agent': 'AISUBS v2.1.0',
           'Content-Type': 'application/json',
           'Accept': 'application/json'
         },
@@ -462,25 +599,37 @@ app.get('/sub.vtt', async (req, res) => {
       const dlJson = await dlPost.json();
       if (dlJson.link) sourceUrl = dlJson.link;
     } catch (e) {
-      console.warn('[AISUBS] OpenSubtitles link resolution error:', e.message);
+      console.warn('[AISUBS] OpenSubtitles link resolution failed:', e.message);
     }
   }
 
-  const cacheKey = `${sourceUrl}_${config.lang}_${config.provider}_${config.offsetMs}_${config.bilingual}`;
+  const cacheKey = `${sourceUrl}_${config.lang}_${config.provider}_${config.offsetMs}_${config.bilingual}_${raw}`;
   if (subCache.has(cacheKey)) {
     console.log('[AISUBS] Serving from cache (Instant)');
     return res.send(subCache.get(cacheKey));
   }
 
   try {
-    const subRes = await fetch(sourceUrl, { signal: AbortSignal.timeout(8000) });
-    if (!subRes.ok) throw new Error(`Source subtitle download failed: ${subRes.status}`);
-    const rawText = await subRes.text();
+    const subRes = await fetch(sourceUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': '*/*'
+      },
+      signal: AbortSignal.timeout(10000)
+    });
 
-    const cues = parseSubtitleCues(rawText);
-    if (!cues || cues.length === 0) throw new Error('No subtitle cues found');
+    if (!subRes.ok) throw new Error(`Download failed with HTTP ${subRes.status}`);
 
-    console.log(`[AISUBS] Parsed ${cues.length} dialogue cues. Starting Gemini scene translation...`);
+    const arrayBuf = await subRes.arrayBuffer();
+    const rawBuffer = Buffer.from(arrayBuf);
+    const decodedText = decompressSubtitleBuffer(rawBuffer);
+
+    const cues = parseSubtitleCues(decodedText);
+    if (!cues || cues.length === 0) {
+      throw new Error('No subtitle cues found after decompression');
+    }
+
+    console.log(`[AISUBS] Decompressed and parsed ${cues.length} dialogue cues.`);
 
     if (config.offsetMs && config.offsetMs !== 0) {
       cues.forEach(c => {
@@ -489,22 +638,22 @@ app.get('/sub.vtt', async (req, res) => {
       });
     }
 
-    // Context-aware batch translation (50 cues per batch)
-    const batchSize = 50;
-    for (let i = 0; i < cues.length; i += batchSize) {
-      const chunk = cues.slice(i, i + batchSize);
-      const texts = chunk.map(c => c.text);
-      console.log(`[AISUBS] Translating batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(cues.length / batchSize)} (${texts.length} lines)...`);
+    // Skip AI translation if raw native track requested
+    if (raw !== 'true') {
+      const batchSize = 50;
+      for (let i = 0; i < cues.length; i += batchSize) {
+        const chunk = cues.slice(i, i + batchSize);
+        const texts = chunk.map(c => c.text);
+        console.log(`[AISUBS] Translating batch ${Math.floor(i / batchSize) + 1}/${Math.ceil(cues.length / batchSize)} (${texts.length} lines)...`);
 
-      const translated = await translateBatch(texts, config.langName || 'Dutch', config);
-
-      chunk.forEach((c, idx) => {
-        const trans = translated[idx] || c.text;
-        c.text = config.bilingual ? `${c.text}\n<c.cyan>${trans}</c>` : trans;
-      });
+        const translated = await translateBatch(texts, config.langName || 'Dutch', config);
+        chunk.forEach((c, idx) => {
+          const trans = translated[idx] || c.text;
+          c.text = config.bilingual ? `${c.text}\n<c.cyan>${trans}</c>` : trans;
+        });
+      }
     }
 
-    // Status Banner cue injected at 00:00:00.800
     const targetName = config.langName || 'Dutch';
     const providerName = config.provider === 'gemini' ? 'Gemini AI' : config.provider.toUpperCase();
     const bannerText = `[ 🤖 AISUBS: Synced to Video & Translated to ${targetName} via ${providerName} ]`;
@@ -512,15 +661,15 @@ app.get('/sub.vtt', async (req, res) => {
     const vttOutput = buildWebVTT(cues, bannerText);
     setInCache(cacheKey, vttOutput);
 
-    console.log(`[AISUBS] Successfully generated and cached translated subtitle (${cues.length} cues).`);
+    console.log(`[AISUBS] Successfully generated VTT (${cues.length} cues).`);
     res.send(vttOutput);
   } catch (err) {
-    console.error('[AISUBS] Error:', err.message);
+    console.error('[AISUBS] Stream error:', err.message);
     res.send(`WEBVTT\n\n1\n00:00:01.000 --> 00:00:06.000\n[AISubs: Error loading/translating: ${err.message}]`);
   }
 });
 
-// Translation Routing
+// Translation Providers
 async function translateBatch(texts, targetLang, config) {
   const apiKey = (config.apiKey || ENV_GEMINI_KEY || '').trim();
   const provider = config.provider || 'gemini';
@@ -533,7 +682,7 @@ async function translateBatch(texts, targetLang, config) {
     return translateWithOpenAICompatible(texts, targetLang, provider, apiKey, model);
   }
 
-  console.warn('[AISUBS] No AI key provided. Using free web engine fallback...');
+  console.warn('[AISUBS] No AI key provided. Using free web fallback...');
   return translateWithFreeFallback(texts, targetLang);
 }
 
@@ -651,37 +800,9 @@ function parseNumberedReply(reply, original) {
 
   for (const line of lines) {
     const match = line.match(/^(\d+)\s*[\|\.\:\-\)]\s*(.*)$/);
-    if (match) {
-      map.set(parseInt(match[1], 10), match[2].trim());
-    }
+    if (match) map.set(parseInt(match[1], 10), match[2].trim());
   }
   return original.map((orig, idx) => map.get(idx + 1) || orig);
-}
-
-function parseSubtitleCues(raw) {
-  const lines = raw.replace(/\r\n/g, '\n').split('\n');
-  const cues = [];
-  let i = 0;
-  const timeRegex = /(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})/;
-
-  while (i < lines.length) {
-    const line = lines[i].trim();
-    const match = timeRegex.exec(line);
-    if (match) {
-      const start = match[1].replace(',', '.');
-      const end = match[2].replace(',', '.');
-      i++;
-      const textLines = [];
-      while (i < lines.length && lines[i].trim() !== '') {
-        textLines.push(lines[i].trim());
-        i++;
-      }
-      cues.push({ start, end, text: textLines.join('\n') });
-    } else {
-      i++;
-    }
-  }
-  return cues;
 }
 
 function buildWebVTT(cues, bannerText) {
