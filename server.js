@@ -87,7 +87,6 @@ function parseConfig(raw) {
   }
 }
 
-// Safe URL Encoding / Decoding helpers to prevent signature corruption
 function encodeSourceParam(url) {
   if (!url) return '';
   return Buffer.from(url, 'utf-8').toString('base64url');
@@ -141,7 +140,7 @@ app.post('/api/verify-opensubtitles', async (req, res) => {
     const testRes = await fetch('https://api.opensubtitles.com/api/v1/subtitles?imdb_id=0111161&languages=en', {
       headers: {
         'Api-Key': apiKey,
-        'User-Agent': 'AISUBS v2.2.0',
+        'User-Agent': 'AISUBS v2.3.0',
         'Accept': 'application/json'
       },
       signal: AbortSignal.timeout(7000)
@@ -156,7 +155,7 @@ app.post('/api/verify-opensubtitles', async (req, res) => {
         method: 'POST',
         headers: {
           'Api-Key': apiKey,
-          'User-Agent': 'AISUBS v2.2.0',
+          'User-Agent': 'AISUBS v2.3.0',
           'Content-Type': 'application/json',
           'Accept': 'application/json'
         },
@@ -255,7 +254,7 @@ app.post('/api/verify-ai', async (req, res) => {
 });
 
 // ----------------------------------------------------
-// Subtitle Discovery & Candidate Assembly
+// Subtitle Discovery & Multi-Provider Candidate Assembly
 // ----------------------------------------------------
 app.use(async (req, res, next) => {
   if (!req.path.includes('/subtitles/')) return next();
@@ -293,7 +292,40 @@ app.use(async (req, res, next) => {
   const targetIso3 = config.lang || 'nld';
   const targetIso1 = targetIso3 === 'nld' ? 'nl' : targetIso3.slice(0, 2);
 
-  // 1. OpenSubtitles API with Hash Matching
+  // 1. OpenSubtitles v3 Public Proxy (Stremio Official CDN - Always Included)
+  try {
+    let pubUrl = `https://opensubtitles-v3.strem.io/subtitles/${mediaType}/${fullId}`;
+    if (extraStr) pubUrl += `/${extraStr}`;
+    pubUrl += '.json';
+
+    const pubRes = await fetch(pubUrl, {
+      headers: { 'User-Agent': 'Stremio/4.4.168', 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(3500)
+    });
+
+    if (pubRes.ok) {
+      const pubData = await pubRes.json();
+      if (Array.isArray(pubData.subtitles)) {
+        pubData.subtitles.forEach(s => {
+          const isTarget = s.lang === targetIso3 || s.lang === targetIso1 || (targetIso3 === 'nld' && s.lang === 'dut');
+          const isEnglish = s.lang === 'eng' || s.lang === 'en';
+
+          const subObj = {
+            source: 'OpenSubtitles-v3',
+            release: filename || 'Synced Video File',
+            isHashMatch: !!videoHash,
+            url: s.url
+          };
+          if (isTarget) nativeTargetSubs.push(subObj);
+          else if (isEnglish) referenceEnSubs.push(subObj);
+        });
+      }
+    }
+  } catch (e) {
+    console.warn('[AISUBS] OpenSubtitles v3 lookup warning:', e.message);
+  }
+
+  // 2. OpenSubtitles API (When API key is provided)
   if (config.osApiKey) {
     try {
       let osUrl = `https://api.opensubtitles.com/api/v1/subtitles?imdb_id=${imdbId.replace('tt', '')}&languages=${targetIso1},en`;
@@ -303,7 +335,7 @@ app.use(async (req, res, next) => {
       const osRes = await fetch(osUrl, {
         headers: {
           'Api-Key': config.osApiKey,
-          'User-Agent': 'AISUBS v2.2.0',
+          'User-Agent': 'AISUBS v2.3.0',
           'Accept': 'application/json'
         },
         signal: AbortSignal.timeout(3500)
@@ -332,48 +364,12 @@ app.use(async (req, res, next) => {
         }
       }
     } catch (e) {
-      console.warn('[AISUBS] OpenSubtitles error:', e.message);
+      console.warn('[AISUBS] OpenSubtitles API warning:', e.message);
     }
   }
 
-  // 2. OpenSubtitles v3 Public Proxy (With official client User-Agent)
-  try {
-    let pubUrl = `https://opensubtitles-v3.strem.io/subtitles/${mediaType}/${fullId}`;
-    if (extraStr) pubUrl += `/${extraStr}`;
-    pubUrl += '.json';
-
-    const pubRes = await fetch(pubUrl, {
-      headers: {
-        'User-Agent': 'Stremio/4.4.168',
-        'Accept': 'application/json'
-      },
-      signal: AbortSignal.timeout(3500)
-    });
-
-    if (pubRes.ok) {
-      const pubData = await pubRes.json();
-      if (Array.isArray(pubData.subtitles)) {
-        pubData.subtitles.forEach(s => {
-          const isTarget = s.lang === targetIso3 || s.lang === targetIso1 || (targetIso3 === 'nld' && s.lang === 'dut');
-          const isEnglish = s.lang === 'eng' || s.lang === 'en';
-
-          const subObj = {
-            source: 'OpenSubtitles-v3',
-            release: filename || 'Synced Video File',
-            isHashMatch: !!videoHash,
-            url: s.url
-          };
-          if (isTarget) nativeTargetSubs.push(subObj);
-          else if (isEnglish) referenceEnSubs.push(subObj);
-        });
-      }
-    }
-  } catch (e) {
-    console.warn('[AISUBS] OpenSubtitles v3 error:', e.message);
-  }
-
-  // 3. SubDL API Fallback
-  if (referenceEnSubs.length === 0 && config.subdlApiKey) {
+  // 3. SubDL API (When configured)
+  if (config.subdlApiKey) {
     try {
       let subdlUrl = `https://api.subdl.com/api/v1/subtitles?api_key=${config.subdlApiKey}&imdb_id=${imdbId}&languages=EN,${targetIso1.toUpperCase()}&subs_per_page=4`;
       if (season && episode) subdlUrl += `&season_number=${season}&episode_number=${episode}&type=tv`;
@@ -396,7 +392,7 @@ app.use(async (req, res, next) => {
         }
       }
     } catch (e) {
-      console.warn('[AISUBS] SubDL error:', e.message);
+      console.warn('[AISUBS] SubDL warning:', e.message);
     }
   }
 
@@ -404,7 +400,7 @@ app.use(async (req, res, next) => {
   const targetName = config.langName || 'Dutch';
   const outSubtitles = [];
 
-  // Track 1: Hash-synced reference subtitle translated with AI (with fallback URLs embedded)
+  // Pass mediaType and fullId so /sub.vtt can perform a live rescue fetch if direct downloads fail
   if (referenceEnSubs.length > 0) {
     const refSub = referenceEnSubs[0];
     const altSub = referenceEnSubs[1];
@@ -415,7 +411,7 @@ app.use(async (req, res, next) => {
 
     outSubtitles.push({
       id: `aisubs-ai-ref-0`,
-      url: `${host}/sub.vtt?cfg=${cfgString}&src=${srcParam}&alt=${altParam}&synced=true`,
+      url: `${host}/sub.vtt?cfg=${cfgString}&type=${mediaType}&id=${fullId}&hash=${videoHash || ''}&src=${srcParam}&alt=${altParam}&synced=true`,
       lang: targetIso3,
       label: `${syncBadge} [AI ${targetName}] · Gemini · ${refSub.release}`
     });
@@ -423,20 +419,19 @@ app.use(async (req, res, next) => {
     if (referenceEnSubs.length > 1) {
       outSubtitles.push({
         id: `aisubs-ai-ref-1`,
-        url: `${host}/sub.vtt?cfg=${cfgString}&src=${altParam}&synced=true`,
+        url: `${host}/sub.vtt?cfg=${cfgString}&type=${mediaType}&id=${fullId}&hash=${videoHash || ''}&src=${altParam}&synced=true`,
         lang: targetIso3,
         label: `⏳ Sync Alternate [AI ${targetName}] · ${altSub.source}`
       });
     }
   }
 
-  // Track 2: Native target language subtitle (if available)
   if (nativeTargetSubs.length > 0) {
     const topNative = nativeTargetSubs[0];
     const srcParam = encodeSourceParam(topNative.url);
     outSubtitles.push({
       id: `aisubs-native-0`,
-      url: `${host}/sub.vtt?cfg=${cfgString}&src=${srcParam}&raw=true`,
+      url: `${host}/sub.vtt?cfg=${cfgString}&type=${mediaType}&id=${fullId}&src=${srcParam}&raw=true`,
       lang: targetIso3,
       label: `✓ Synced Native · ${topNative.source} · ${topNative.release}`
     });
@@ -447,11 +442,12 @@ app.use(async (req, res, next) => {
 });
 
 // ----------------------------------------------------
-// Robust Multi-Candidate Subtitle Downloader
+// Resilient Multi-Candidate Subtitle Downloader & Live Rescue
 // ----------------------------------------------------
-async function downloadSubtitleWithFallbacks(candidateUrls) {
+async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId) {
   let lastError = null;
 
+  // 1. Iterate over candidate URLs
   for (let rawUrl of candidateUrls) {
     if (!rawUrl) continue;
     let targetUrl = rawUrl;
@@ -466,60 +462,85 @@ async function downloadSubtitleWithFallbacks(candidateUrls) {
           method: 'POST',
           headers: {
             'Api-Key': apiKey,
-            'User-Agent': 'AISUBS v2.2.0',
+            'User-Agent': 'AISUBS v2.3.0',
             'Content-Type': 'application/json',
             'Accept': 'application/json'
           },
           body: JSON.stringify({ file_id: Number(fileId) }),
-          signal: AbortSignal.timeout(6000)
+          signal: AbortSignal.timeout(5000)
         });
         const dlJson = await dlPost.json();
         if (dlJson.link) {
           targetUrl = dlJson.link;
         } else {
-          console.warn('[AISUBS] OpenSubtitles download returned no link. Moving to next candidate...');
+          console.warn('[AISUBS] OpenSubtitles download returned no link. Skipping candidate...');
           continue;
         }
       } catch (e) {
-        console.warn('[AISUBS] OpenSubtitles resolve failed:', e.message);
+        console.warn('[AISUBS] OpenSubtitles resolve warning:', e.message);
         continue;
       }
     }
 
-    // Try multiple standard user-agents to avoid Cloudflare 503 bot triggers
-    const userAgents = [
-      'Stremio/4.4.168',
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
-      'AISUBS/2.2.0'
-    ];
+    try {
+      console.log(`[AISUBS] Downloading candidate: ${targetUrl.slice(0, 70)}...`);
+      const res = await fetch(targetUrl, {
+        headers: { 'User-Agent': 'Stremio/4.4.168', 'Accept': '*/*' },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(8000)
+      });
 
-    for (const ua of userAgents) {
-      try {
-        console.log(`[AISUBS] Fetching candidate: ${targetUrl.slice(0, 65)}... [${ua.split('/')[0]}]`);
-        const res = await fetch(targetUrl, {
-          headers: {
-            'User-Agent': ua,
-            'Accept': '*/*',
-            'Accept-Encoding': 'gzip, deflate, br'
-          },
-          redirect: 'follow',
-          signal: AbortSignal.timeout(8000)
-        });
-
-        if (res.ok) {
-          const arrayBuf = await res.arrayBuffer();
-          const buffer = Buffer.from(arrayBuf);
-          if (buffer.length > 40) {
-            return { buffer, finalUrl: targetUrl };
-          }
-        } else {
-          console.warn(`[AISUBS] Candidate returned HTTP ${res.status}`);
-          lastError = new Error(`Download failed with HTTP ${res.status}`);
-        }
-      } catch (err) {
-        console.warn('[AISUBS] Candidate fetch attempt failed:', err.message);
-        lastError = err;
+      if (res.ok) {
+        const arrayBuf = await res.arrayBuffer();
+        const buffer = Buffer.from(arrayBuf);
+        if (buffer.length > 40) return { buffer, finalUrl: targetUrl };
+      } else {
+        console.warn(`[AISUBS] Candidate returned HTTP ${res.status}`);
+        lastError = new Error(`Download failed with HTTP ${res.status}`);
       }
+    } catch (err) {
+      console.warn('[AISUBS] Candidate download failed:', err.message);
+      lastError = err;
+    }
+  }
+
+  // 2. Live Rescue Fallback: Query Stremio OpenSubtitles v3 CDN directly
+  if (mediaType && fullId) {
+    console.log(`[AISUBS] Primary links failed. Initiating Live Rescue for ${mediaType} ${fullId}...`);
+    try {
+      const rescueUrl = `https://opensubtitles-v3.strem.io/subtitles/${mediaType}/${fullId}.json`;
+      const rescueRes = await fetch(rescueUrl, {
+        headers: { 'User-Agent': 'Stremio/4.4.168', 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(5000)
+      });
+
+      if (rescueRes.ok) {
+        const rescueData = await rescueRes.json();
+        if (Array.isArray(rescueData.subtitles)) {
+          const enList = rescueData.subtitles.filter(s => s.lang === 'eng' || s.lang === 'en');
+          const pool = enList.length > 0 ? enList : rescueData.subtitles;
+
+          for (const s of pool.slice(0, 3)) {
+            try {
+              console.log(`[AISUBS] Attempting rescue candidate: ${s.url.slice(0, 70)}...`);
+              const fileRes = await fetch(s.url, {
+                headers: { 'User-Agent': 'Stremio/4.4.168', 'Accept': '*/*' },
+                redirect: 'follow',
+                signal: AbortSignal.timeout(8000)
+              });
+              if (fileRes.ok) {
+                const arrayBuf = await fileRes.arrayBuffer();
+                const buffer = Buffer.from(arrayBuf);
+                if (buffer.length > 40) return { buffer, finalUrl: s.url };
+              }
+            } catch (err) {
+              console.warn('[AISUBS] Rescue candidate failed:', err.message);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[AISUBS] Rescue query failed:', err.message);
     }
   }
 
@@ -584,7 +605,6 @@ function parseSubtitleCues(raw) {
   const clean = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
   const cues = [];
 
-  // ASS / SSA Events
   if (clean.includes('[Events]') && clean.includes('Dialogue:')) {
     const lines = clean.split('\n');
     for (const line of lines) {
@@ -601,7 +621,6 @@ function parseSubtitleCues(raw) {
     if (cues.length > 0) return cues;
   }
 
-  // Regex matches 1 or 2 digit hours
   const timeRegex = /(\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,\.]\d{1,3})/;
   const lines = clean.split('\n');
   let i = 0;
@@ -619,9 +638,7 @@ function parseSubtitleCues(raw) {
         if (!textLine.includes('-->')) textLines.push(textLine);
         i++;
       }
-      if (textLines.length > 0) {
-        cues.push({ start, end, text: textLines.join('\n') });
-      }
+      if (textLines.length > 0) cues.push({ start, end, text: textLines.join('\n') });
     } else {
       i++;
     }
@@ -657,10 +674,9 @@ function padAssTime(t) {
 // Subtitle Stream & Translation Delivery (/sub.vtt)
 // ----------------------------------------------------
 app.get('/sub.vtt', async (req, res) => {
-  const { cfg, src, alt, raw } = req.query;
+  const { cfg, src, alt, type, id, raw } = req.query;
   const config = parseConfig(cfg);
 
-  // Safely decode candidate URLs
   const primaryUrl = decodeSourceParam(src);
   const altUrl = decodeSourceParam(alt);
   const candidates = [primaryUrl, altUrl].filter(Boolean);
@@ -670,14 +686,14 @@ app.get('/sub.vtt', async (req, res) => {
 
   console.log(`\n[AISUBS-RENDER] Request for ${config.langName} (${config.lang})`);
 
-  const cacheKey = `${primaryUrl}_${config.lang}_${config.provider}_${config.offsetMs}_${config.bilingual}_${raw}`;
+  const cacheKey = `${primaryUrl || id}_${config.lang}_${config.provider}_${config.offsetMs}_${config.bilingual}_${raw}`;
   if (subCache.has(cacheKey)) {
     console.log('[AISUBS] Serving from cache (Instant)');
     return res.send(subCache.get(cacheKey));
   }
 
   try {
-    const { buffer } = await downloadSubtitleWithFallbacks(candidates);
+    const { buffer } = await downloadSubtitleWithFallbacks(candidates, type, id);
     const decodedText = decompressSubtitleBuffer(buffer);
 
     const cues = parseSubtitleCues(decodedText);
@@ -694,7 +710,6 @@ app.get('/sub.vtt', async (req, res) => {
       });
     }
 
-    // Skip AI translation if native track requested
     if (raw !== 'true') {
       const batchSize = 50;
       for (let i = 0; i < cues.length; i += batchSize) {
