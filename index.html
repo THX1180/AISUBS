@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AISUBS — AI Subtitle Translation & Sync</title>
+  <title>AISUBS — Auto-Sync & AI Subtitle Translation</title>
   <link rel="stylesheet" href="style.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -15,22 +15,43 @@
 
   <main class="container">
     <header class="header">
-      <div class="badge">v1.4.0 • Gemini Scene-Translation</div>
+      <div class="badge">v2.0.0 • SubtitleSync Backend & Profiles</div>
       <h1>AISUBS</h1>
-      <p class="subtitle">Real-time subtitle translation and sync for Stremio & Nuvio.</p>
+      <p class="subtitle">Auto-synced subtitles matched to your video file & translated by AI.</p>
     </header>
 
     <div class="glass-card">
+
+      <!-- Profile Manager Toolbar -->
+      <div class="profile-toolbar">
+        <div class="profile-select-group">
+          <label for="profileSelect">Active Profile</label>
+          <div class="select-wrapper">
+            <select id="profileSelect">
+              <option value="default">Dutch (Default)</option>
+            </select>
+          </div>
+        </div>
+        <div class="profile-actions">
+          <button type="button" id="saveProfileBtn" class="btn btn-sm btn-accent" title="Save changes to active profile">💾 Save</button>
+          <button type="button" id="newProfileBtn" class="btn btn-sm" title="Create a new profile">➕ New</button>
+          <button type="button" id="deleteProfileBtn" class="btn btn-sm btn-danger" title="Delete active profile">🗑️</button>
+          <button type="button" id="exportProfilesBtn" class="btn btn-sm" title="Backup profiles">📤</button>
+          <button type="button" id="importProfilesBtn" class="btn btn-sm" title="Restore profiles">📥</button>
+          <input type="file" id="importFileInput" accept=".json" style="display: none;">
+        </div>
+      </div>
+
       <form id="configForm">
 
-        <!-- 1. Target Language -->
+        <!-- 1. Target Language (Default Dutch) -->
         <div class="section-title">1. Target Language</div>
         <div class="form-group">
-          <label for="langSelect">Target Subtitle Language</label>
+          <label for="langSelect">Language Track</label>
           <div class="select-wrapper">
             <select id="langSelect">
+              <option value="nld|Dutch|🇳🇱" selected>🇳🇱 Dutch (Nederlands)</option>
               <option value="spa|Spanish|🇪🇸">🇪🇸 Spanish (Español)</option>
-              <option value="nld|Dutch|🇳🇱">🇳🇱 Dutch (Nederlands)</option>
               <option value="fre|French|🇫🇷">🇫🇷 French (Français)</option>
               <option value="ger|German|🇩🇪">🇩🇪 German (Deutsch)</option>
               <option value="ita|Italian|🇮🇹">🇮🇹 Italian (Italiano)</option>
@@ -77,10 +98,10 @@
           <div class="form-group">
             <label for="apiKey">API Key</label>
             <div class="input-with-eye">
-              <input type="password" id="apiKey" placeholder="AIzaSy... (Leave empty if set in Render env)">
+              <input type="password" id="apiKey" placeholder="AIzaSy... (Saved in profile)">
               <button type="button" class="eye-btn" data-target="apiKey">👁️</button>
             </div>
-            <span class="helper">Get a free key in 30 seconds at <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:#818cf8;">Google AI Studio</a>.</span>
+            <span class="helper">Free key available at <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:#818cf8;">Google AI Studio</a>.</span>
           </div>
           <div class="form-group">
             <label for="modelInput">Model</label>
@@ -91,7 +112,7 @@
 
         <!-- 3. Subtitle Sources -->
         <div class="section-title">3. Subtitle Sources (Optional)</div>
-        <p class="section-desc">Leave blank to use the built-in free OpenSubtitles source.</p>
+        <p class="section-desc">SubtitleSync engine matches your video's hash to guarantee sync.</p>
 
         <!-- OpenSubtitles.com -->
         <div class="credential-box">
@@ -187,6 +208,10 @@
             Copy URL (Nuvio)
           </button>
 
+          <button type="button" id="saveTvBtn" class="btn btn-secondary" title="Save as short TV URL">
+            📺 TV Link
+          </button>
+
           <button type="button" id="qrBtn" class="btn btn-icon" title="Scan QR Code for Android / TV">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
           </button>
@@ -209,6 +234,7 @@
 
   <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
   <script>
+    // Eye toggles for passwords
     document.querySelectorAll('.eye-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         const input = document.getElementById(btn.getAttribute('data-target'));
@@ -222,30 +248,191 @@
       });
     });
 
-    const providerSelect = document.getElementById('providerSelect');
-    const aiCredentials = document.getElementById('aiCredentials');
+    // Form inputs
     const langSelect = document.getElementById('langSelect');
+    const providerSelect = document.getElementById('providerSelect');
     const apiKey = document.getElementById('apiKey');
     const modelInput = document.getElementById('modelInput');
     const offsetMs = document.getElementById('offsetMs');
     const bilingual = document.getElementById('bilingual');
-
     const osApiKey = document.getElementById('osApiKey');
     const osUsername = document.getElementById('osUsername');
     const osPassword = document.getElementById('osPassword');
     const subdlApiKey = document.getElementById('subdlApiKey');
     const subsourceApiKey = document.getElementById('subsourceApiKey');
 
+    // Profile Management System
+    const PROFILE_STORAGE_KEY = 'aisubs_profiles_v2';
+    const ACTIVE_PROFILE_KEY = 'aisubs_active_profile_v2';
+
+    let profiles = {};
+    try {
+      profiles = JSON.parse(localStorage.getItem(PROFILE_STORAGE_KEY)) || {};
+    } catch {
+      profiles = {};
+    }
+
+    if (Object.keys(profiles).length === 0) {
+      profiles['default'] = {
+        name: 'Dutch (Default)',
+        lang: 'nld|Dutch|🇳🇱',
+        provider: 'gemini',
+        apiKey: '',
+        model: 'gemini-2.0-flash',
+        offsetMs: 0,
+        bilingual: false,
+        osApiKey: '',
+        osUsername: '',
+        osPassword: '',
+        subdlApiKey: '',
+        subsourceApiKey: ''
+      };
+    }
+
+    const profileSelect = document.getElementById('profileSelect');
+
+    function populateProfileSelect() {
+      profileSelect.innerHTML = '';
+      Object.keys(profiles).forEach(key => {
+        const opt = document.createElement('option');
+        opt.value = key;
+        opt.textContent = profiles[key].name || key;
+        profileSelect.appendChild(opt);
+      });
+      const active = localStorage.getItem(ACTIVE_PROFILE_KEY) || 'default';
+      profileSelect.value = profiles[active] ? active : Object.keys(profiles)[0];
+    }
+
+    function loadProfile(key) {
+      const p = profiles[key];
+      if (!p) return;
+      langSelect.value = p.lang || 'nld|Dutch|🇳🇱';
+      providerSelect.value = p.provider || 'gemini';
+      apiKey.value = p.apiKey || '';
+      modelInput.value = p.model || 'gemini-2.0-flash';
+      offsetMs.value = p.offsetMs || 0;
+      bilingual.checked = !!p.bilingual;
+      osApiKey.value = p.osApiKey || '';
+      osUsername.value = p.osUsername || '';
+      osPassword.value = p.osPassword || '';
+      subdlApiKey.value = p.subdlApiKey || '';
+      subsourceApiKey.value = p.subsourceApiKey || '';
+      localStorage.setItem(ACTIVE_PROFILE_KEY, key);
+      toggleCredentials();
+    }
+
+    function saveCurrentProfile() {
+      const active = profileSelect.value;
+      if (!profiles[active]) return;
+      profiles[active] = {
+        ...profiles[active],
+        lang: langSelect.value,
+        provider: providerSelect.value,
+        apiKey: apiKey.value.trim(),
+        model: modelInput.value.trim(),
+        offsetMs: parseInt(offsetMs.value, 10) || 0,
+        bilingual: bilingual.checked,
+        osApiKey: osApiKey.value.trim(),
+        osUsername: osUsername.value.trim(),
+        osPassword: osPassword.value.trim(),
+        subdlApiKey: subdlApiKey.value.trim(),
+        subsourceApiKey: subsourceApiKey.value.trim()
+      };
+      localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(profiles));
+      showToast('✓ Profile saved!');
+    }
+
+    profileSelect.addEventListener('change', () => loadProfile(profileSelect.value));
+    document.getElementById('saveProfileBtn').addEventListener('click', saveCurrentProfile);
+
+    document.getElementById('newProfileBtn').addEventListener('click', () => {
+      const name = prompt('Enter a name for the new profile:', 'Living Room TV');
+      if (!name) return;
+      const key = 'prof_' + Date.now();
+      profiles[key] = {
+        name,
+        lang: langSelect.value,
+        provider: providerSelect.value,
+        apiKey: apiKey.value.trim(),
+        model: modelInput.value.trim(),
+        offsetMs: 0,
+        bilingual: false,
+        osApiKey: '',
+        osUsername: '',
+        osPassword: '',
+        subdlApiKey: '',
+        subsourceApiKey: ''
+      };
+      localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(profiles));
+      populateProfileSelect();
+      profileSelect.value = key;
+      loadProfile(key);
+      showToast(`✓ Created profile "${name}"`);
+    });
+
+    document.getElementById('deleteProfileBtn').addEventListener('click', () => {
+      const active = profileSelect.value;
+      if (Object.keys(profiles).length <= 1) {
+        alert('You must keep at least one profile.');
+        return;
+      }
+      if (confirm(`Delete profile "${profiles[active].name}"?`)) {
+        delete profiles[active];
+        localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(profiles));
+        populateProfileSelect();
+        loadProfile(profileSelect.value);
+        showToast('✓ Profile deleted.');
+      }
+    });
+
+    document.getElementById('exportProfilesBtn').addEventListener('click', () => {
+      const blob = new Blob([JSON.stringify(profiles, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'aisubs-profiles.json';
+      a.click();
+    });
+
+    document.getElementById('importProfilesBtn').addEventListener('click', () => {
+      document.getElementById('importFileInput').click();
+    });
+
+    document.getElementById('importFileInput').addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const imported = JSON.parse(event.target.result);
+          if (typeof imported === 'object') {
+            profiles = { ...profiles, ...imported };
+            localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(profiles));
+            populateProfileSelect();
+            loadProfile(profileSelect.value);
+            showToast('✓ Profiles imported successfully!');
+          }
+        } catch {
+          alert('Invalid profile JSON file.');
+        }
+      };
+      reader.readAsText(file);
+    });
+
+    populateProfileSelect();
+    loadProfile(profileSelect.value);
+
     function toggleCredentials() {
+      const aiCreds = document.getElementById('aiCredentials');
       if (providerSelect.value === 'free') {
-        aiCredentials.classList.add('hidden-field');
+        aiCreds.classList.add('hidden-field');
       } else {
-        aiCredentials.classList.remove('hidden-field');
+        aiCreds.classList.remove('hidden-field');
       }
     }
     providerSelect.addEventListener('change', toggleCredentials);
-    toggleCredentials();
 
+    // Credential Verifications
     async function verifyService(url, body, badgeEl, btnEl) {
       const origText = btnEl.textContent;
       btnEl.textContent = 'Checking...';
@@ -312,9 +499,9 @@
       );
     });
 
-    function buildManifestUrl() {
+    function getActiveConfigObj() {
       const [langCode, langName] = langSelect.value.split('|');
-      const config = {
+      return {
         lang: langCode,
         langName: langName,
         provider: providerSelect.value,
@@ -328,12 +515,15 @@
         subdlApiKey: subdlApiKey.value.trim(),
         subsourceApiKey: subsourceApiKey.value.trim()
       };
+    }
 
+    function buildManifestUrl() {
+      saveCurrentProfile();
+      const config = getActiveConfigObj();
       const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(config))))
         .replace(/\+/g, '-')
         .replace(/\//g, '_')
         .replace(/=+$/, '');
-
       return `${window.location.origin}/${b64}/manifest.json`;
     }
 
@@ -356,6 +546,28 @@
         showToast('✓ URL Copied! Paste into Nuvio or Stremio.');
       } catch {
         prompt('Copy your addon URL:', url);
+      }
+    });
+
+    // Save as Short TV URL
+    document.getElementById('saveTvBtn').addEventListener('click', async () => {
+      saveCurrentProfile();
+      const activeName = profiles[profileSelect.value].name || 'my-tv';
+      const config = getActiveConfigObj();
+
+      try {
+        const res = await fetch('/api/profiles/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: activeName, config })
+        });
+        const data = await res.json();
+        if (data.url) {
+          await navigator.clipboard.writeText(data.url);
+          showToast(`✓ Short TV URL created & copied: ${data.url}`);
+        }
+      } catch (e) {
+        showToast('✗ Error saving TV link');
       }
     });
 
