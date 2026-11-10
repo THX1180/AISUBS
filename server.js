@@ -3,6 +3,7 @@ import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { getManifest } from './manifest.js';
 
@@ -41,6 +42,7 @@ app.use(express.json({ limit: '10mb' }));
 app.get(['/', '/index.html', '/configure', '/:config/configure', '/p/:profile/configure'],
   (req, res) => res.sendFile(path.join(ROOT, 'index.html')));
 app.get('/style.css', (req, res) => res.sendFile(path.join(ROOT, 'style.css')));
+app.get('/logo.png', (req, res) => res.sendFile(path.join(ROOT, 'logo.png')));
 
 // Persistent Profiles
 const PROFILES_FILE = path.join(process.cwd(), 'profiles.json');
@@ -337,7 +339,7 @@ app.post('/api/profiles/save', (req, res) => {
   const { name, config } = req.body;
   if (!name || !config) return res.status(400).json({ error: 'Name and config required' });
 
-  const slug = name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').slice(0, 32);
+  const slug = `${name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').slice(0, 20)}-${crypto.randomBytes(8).toString('hex')}`;
   savedProfiles[slug] = config;
   persistProfiles();
 
@@ -351,7 +353,7 @@ app.get(['/manifest.json', '/p/:profile/manifest.json', '/:param/manifest.json']
   const param = req.params.profile || req.params.param || '';
   const config = parseConfig(param);
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.json(getManifest(config));
+  res.json(getManifest(config, publicBase(req)));
 });
 
 // ----------------------------------------------------
@@ -697,7 +699,7 @@ function parseSubtitleCues(raw) {
         if (parts.length >= 10) {
           const start = padAssTime(parts[1].trim());
           const end = padAssTime(parts[2].trim());
-          const text = parts.slice(9).join(',').replace(/\\N/g, '\n').replace(/\{.*?\}/g, '').trim();
+          const text = cleanCueText(parts.slice(9).join(',').replace(/\\N/g, '\n'));
           if (text) cues.push({ start, end, text });
         }
       }
@@ -722,13 +724,25 @@ function parseSubtitleCues(raw) {
         if (!textLine.includes('-->')) textLines.push(textLine);
         i++;
       }
-      if (textLines.length > 0) cues.push({ start, end, text: textLines.join('\n') });
+      const text = cleanCueText(textLines.join('\n'));
+      if (text) cues.push({ start, end, text });
     } else {
       i++;
     }
   }
 
   return cues;
+}
+
+// Many SRT/ASS-derived files carry positioning such as {\an8} (top of screen, used for signs/credits) or
+// {\pos(x,y)}. Players apply these literally, which is why some lines jump to the top. We strip every
+// override and emit cues WITHOUT VTT settings (no line:/position:/align:), so the player's own
+// subtitle-position setting (Nuvio/Stremio) always applies. Must run BEFORE translation so the model can't mangle tags.
+function cleanCueText(t) {
+  return t
+    .replace(/\{[^}]*\}/g, '')           // ASS/SSA override blocks: {\an8} {\pos(..)} {\i1} ...
+    .replace(/\\an?[1-9]/g, '')        // stray \an8 without braces
+    .split('\n').map(l => l.trim()).filter(Boolean).join('\n');
 }
 
 function normalizeTimestamp(ts) {
