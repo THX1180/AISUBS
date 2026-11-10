@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AISUBS — Auto-Sync & AI Subtitle Translation</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="/style.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -15,9 +15,9 @@
 
   <main class="container">
     <header class="header">
-      <div class="badge">v2.0.0 • SubtitleSync Backend & Profiles</div>
+      <div class="badge">v2.5.0 • Release Match & Embedded Sync</div>
       <h1>AISUBS</h1>
-      <p class="subtitle">Auto-synced subtitles matched to your video file & translated by AI.</p>
+      <p class="subtitle">Auto-synced subtitles matched to your exact video release & translated by AI.</p>
     </header>
 
     <div class="glass-card">
@@ -33,21 +33,21 @@
           </div>
         </div>
         <div class="profile-actions">
-          <button type="button" id="saveProfileBtn" class="btn btn-sm btn-accent" title="Save changes to active profile">💾 Save</button>
-          <button type="button" id="newProfileBtn" class="btn btn-sm" title="Create a new profile">➕ New</button>
-          <button type="button" id="deleteProfileBtn" class="btn btn-sm btn-danger" title="Delete active profile">🗑️</button>
-          <button type="button" id="exportProfilesBtn" class="btn btn-sm" title="Backup profiles">📤</button>
-          <button type="button" id="importProfilesBtn" class="btn btn-sm" title="Restore profiles">📥</button>
+          <button type="button" id="saveProfileBtn" class="btn btn-sm btn-accent" title="Save changes">💾 Save</button>
+          <button type="button" id="newProfileBtn" class="btn btn-sm" title="New profile">➕ New</button>
+          <button type="button" id="deleteProfileBtn" class="btn btn-sm btn-danger" title="Delete profile">🗑️</button>
+          <button type="button" id="exportProfilesBtn" class="btn btn-sm" title="Backup">📤</button>
+          <button type="button" id="importProfilesBtn" class="btn btn-sm" title="Restore">📥</button>
           <input type="file" id="importFileInput" accept=".json" style="display: none;">
         </div>
       </div>
 
       <form id="configForm">
 
-        <!-- 1. Target Language (Default Dutch) -->
+        <!-- 1. Target Language -->
         <div class="section-title">1. Target Language</div>
         <div class="form-group">
-          <label for="langSelect">Language Track</label>
+          <label for="langSelect">Preferred Subtitle Language</label>
           <div class="select-wrapper">
             <select id="langSelect">
               <option value="nld|Dutch|🇳🇱" selected>🇳🇱 Dutch (Nederlands)</option>
@@ -98,7 +98,7 @@
           <div class="form-group">
             <label for="apiKey">API Key</label>
             <div class="input-with-eye">
-              <input type="password" id="apiKey" placeholder="AIzaSy... (Saved in profile)">
+              <input type="password" id="apiKey" placeholder="AIzaSy... (Leave empty if set in Render env)">
               <button type="button" class="eye-btn" data-target="apiKey">👁️</button>
             </div>
             <span class="helper">Free key available at <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:#818cf8;">Google AI Studio</a>.</span>
@@ -110,9 +110,26 @@
           <button type="button" id="verifyAiBtn" class="btn btn-sm">Verify AI Key</button>
         </div>
 
-        <!-- 3. Subtitle Sources -->
-        <div class="section-title">3. Subtitle Sources (Optional)</div>
-        <p class="section-desc">SubtitleSync engine matches your video's hash to guarantee sync.</p>
+        <!-- 3. Subtitle Sources & Embedded Sync -->
+        <div class="section-title">3. Subtitle Sources & Embedded Sync</div>
+        <p class="section-desc">Release-matching engine automatically pairs with the exact stream playing.</p>
+
+        <!-- TorBox (Embedded Subtitle Extraction) -->
+        <div class="credential-box">
+          <div class="box-header">
+            <span>📦 TorBox (Extract Video's Embedded Subtitles)</span>
+            <span id="tbBadge" class="status-indicator"></span>
+          </div>
+          <div class="form-group">
+            <label>TorBox API Key</label>
+            <div class="input-with-eye">
+              <input type="password" id="torboxApiKey" placeholder="TorBox API Token">
+              <button type="button" class="eye-btn" data-target="torboxApiKey">👁️</button>
+            </div>
+            <span class="helper">Enables reading embedded subtitle tracks directly from TorBox streams.</span>
+          </div>
+          <button type="button" id="verifyTbBtn" class="btn btn-sm">Verify TorBox</button>
+        </div>
 
         <!-- OpenSubtitles.com -->
         <div class="credential-box">
@@ -208,7 +225,7 @@
             Copy URL (Nuvio)
           </button>
 
-          <button type="button" id="saveTvBtn" class="btn btn-secondary" title="Save as short TV URL">
+          <button type="button" id="saveTvBtn" class="btn btn-secondary" title="Save short TV URL">
             📺 TV Link
           </button>
 
@@ -234,7 +251,6 @@
 
   <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
   <script>
-    // Eye toggles for passwords
     document.querySelectorAll('.eye-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         const input = document.getElementById(btn.getAttribute('data-target'));
@@ -248,22 +264,21 @@
       });
     });
 
-    // Form inputs
     const langSelect = document.getElementById('langSelect');
     const providerSelect = document.getElementById('providerSelect');
     const apiKey = document.getElementById('apiKey');
     const modelInput = document.getElementById('modelInput');
     const offsetMs = document.getElementById('offsetMs');
     const bilingual = document.getElementById('bilingual');
+    const torboxApiKey = document.getElementById('torboxApiKey');
     const osApiKey = document.getElementById('osApiKey');
     const osUsername = document.getElementById('osUsername');
     const osPassword = document.getElementById('osPassword');
     const subdlApiKey = document.getElementById('subdlApiKey');
     const subsourceApiKey = document.getElementById('subsourceApiKey');
 
-    // Profile Management System
-    const PROFILE_STORAGE_KEY = 'aisubs_profiles_v2';
-    const ACTIVE_PROFILE_KEY = 'aisubs_active_profile_v2';
+    const PROFILE_STORAGE_KEY = 'aisubs_profiles_v3';
+    const ACTIVE_PROFILE_KEY = 'aisubs_active_profile_v3';
 
     let profiles = {};
     try {
@@ -281,6 +296,7 @@
         model: 'gemini-2.0-flash',
         offsetMs: 0,
         bilingual: false,
+        torboxApiKey: '',
         osApiKey: '',
         osUsername: '',
         osPassword: '',
@@ -312,6 +328,7 @@
       modelInput.value = p.model || 'gemini-2.0-flash';
       offsetMs.value = p.offsetMs || 0;
       bilingual.checked = !!p.bilingual;
+      torboxApiKey.value = p.torboxApiKey || '';
       osApiKey.value = p.osApiKey || '';
       osUsername.value = p.osUsername || '';
       osPassword.value = p.osPassword || '';
@@ -332,6 +349,7 @@
         model: modelInput.value.trim(),
         offsetMs: parseInt(offsetMs.value, 10) || 0,
         bilingual: bilingual.checked,
+        torboxApiKey: torboxApiKey.value.trim(),
         osApiKey: osApiKey.value.trim(),
         osUsername: osUsername.value.trim(),
         osPassword: osPassword.value.trim(),
@@ -346,17 +364,18 @@
     document.getElementById('saveProfileBtn').addEventListener('click', saveCurrentProfile);
 
     document.getElementById('newProfileBtn').addEventListener('click', () => {
-      const name = prompt('Enter a name for the new profile:', 'Living Room TV');
+      const name = prompt('Name for new profile:', 'Living Room TV');
       if (!name) return;
       const key = 'prof_' + Date.now();
       profiles[key] = {
         name,
-        lang: langSelect.value,
+        lang: 'nld|Dutch|🇳🇱',
         provider: providerSelect.value,
         apiKey: apiKey.value.trim(),
         model: modelInput.value.trim(),
         offsetMs: 0,
         bilingual: false,
+        torboxApiKey: '',
         osApiKey: '',
         osUsername: '',
         osPassword: '',
@@ -413,7 +432,7 @@
             showToast('✓ Profiles imported successfully!');
           }
         } catch {
-          alert('Invalid profile JSON file.');
+          alert('Invalid profile JSON.');
         }
       };
       reader.readAsText(file);
@@ -432,7 +451,7 @@
     }
     providerSelect.addEventListener('change', toggleCredentials);
 
-    // Credential Verifications
+    // Verification calls
     async function verifyService(url, body, badgeEl, btnEl) {
       const origText = btnEl.textContent;
       btnEl.textContent = 'Checking...';
@@ -462,6 +481,15 @@
         btnEl.disabled = false;
       }
     }
+
+    document.getElementById('verifyTbBtn').addEventListener('click', () => {
+      verifyService(
+        '/api/verify-torbox',
+        { apiKey: torboxApiKey.value.trim() },
+        document.getElementById('tbBadge'),
+        document.getElementById('verifyTbBtn')
+      );
+    });
 
     document.getElementById('verifyOsBtn').addEventListener('click', () => {
       verifyService(
@@ -509,6 +537,7 @@
         model: modelInput.value.trim() || 'gemini-2.0-flash',
         offsetMs: parseInt(offsetMs.value, 10) || 0,
         bilingual: bilingual.checked,
+        torboxApiKey: torboxApiKey.value.trim(),
         osApiKey: osApiKey.value.trim(),
         osUsername: osUsername.value.trim(),
         osPassword: osPassword.value.trim(),
@@ -545,11 +574,10 @@
         await navigator.clipboard.writeText(url);
         showToast('✓ URL Copied! Paste into Nuvio or Stremio.');
       } catch {
-        prompt('Copy your addon URL:', url);
+        prompt('Copy addon URL:', url);
       }
     });
 
-    // Save as Short TV URL
     document.getElementById('saveTvBtn').addEventListener('click', async () => {
       saveCurrentProfile();
       const activeName = profiles[profileSelect.value].name || 'my-tv';
@@ -564,10 +592,10 @@
         const data = await res.json();
         if (data.url) {
           await navigator.clipboard.writeText(data.url);
-          showToast(`✓ Short TV URL created & copied: ${data.url}`);
+          showToast(`✓ TV URL created & copied: ${data.url}`);
         }
       } catch (e) {
-        showToast('✗ Error saving TV link');
+        showToast('✗ Error creating TV link');
       }
     });
 
