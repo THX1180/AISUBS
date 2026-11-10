@@ -8,11 +8,12 @@ import { getManifest } from './manifest.js';
 const app = express();
 const PORT = process.env.PORT || 7860;
 
+// Strict Dutch default
 const ENV_GEMINI_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
 const ENV_TARGET_LANG = process.env.TARGET_LANG || 'nld';
 
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static('.'));
 
 // Persistent Profiles
@@ -47,7 +48,7 @@ function setInCache(key, vtt) {
 }
 
 const ISO_LANG_MAP = {
-  nld: 'Dutch', spa: 'Spanish', fre: 'French', ger: 'German', ita: 'Italian',
+  nld: 'Dutch', dut: 'Dutch', spa: 'Spanish', fre: 'French', ger: 'German', ita: 'Italian',
   por: 'Portuguese', pob: 'Portuguese (Brazil)', rus: 'Russian', ara: 'Arabic',
   heb: 'Hebrew', tur: 'Turkish', pol: 'Polish', jpn: 'Japanese', kor: 'Korean',
   chi: 'Chinese', hin: 'Hindi', swe: 'Swedish', ell: 'Greek', ukr: 'Ukrainian',
@@ -56,13 +57,14 @@ const ISO_LANG_MAP = {
 
 function parseConfig(raw) {
   const baseDefault = {
-    lang: ENV_TARGET_LANG,
-    langName: ISO_LANG_MAP[ENV_TARGET_LANG] || 'Dutch',
+    lang: 'nld',
+    langName: 'Dutch',
     provider: ENV_GEMINI_KEY ? 'gemini' : 'gemini',
     apiKey: ENV_GEMINI_KEY,
     model: 'gemini-2.0-flash',
     offsetMs: 0,
-    bilingual: false
+    bilingual: false,
+    torboxApiKey: ''
   };
 
   if (!raw) return baseDefault;
@@ -102,36 +104,68 @@ function decodeSourceParam(param) {
 }
 
 // ----------------------------------------------------
-// Profile Storage Endpoints
+// Smart Release-Matching Scoring (Guarantees Sync)
 // ----------------------------------------------------
-app.post('/api/profiles/save', (req, res) => {
-  const { name, config } = req.body;
-  if (!name || !config) return res.status(400).json({ error: 'Name and config required' });
+function scoreSubtitleMatch(subReleaseName, videoFilename, isHashMatch = false) {
+  if (isHashMatch) return 1000;
 
-  const slug = name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').slice(0, 32);
-  savedProfiles[slug] = config;
-  persistProfiles();
+  let score = 0;
+  const subClean = (subReleaseName || '').toLowerCase().replace(/[\.\-\_]/g, ' ');
+  const vidClean = (videoFilename || '').toLowerCase().replace(/[\.\-\_]/g, ' ');
 
-  res.json({ success: true, slug, url: `${req.protocol}://${req.get('host')}/p/${slug}/manifest.json` });
-});
+  const groups = ['flux', 'ntb', 'yify', 'yts', 'rarbg', 'psa', 'ion10', 'galaxyrg', 'cmrg', 'sparks', 'geckos', 'glhf', 'deflate', 'amzn', 'nf', 'atvp', 'dnp', 'qxr', 'swag'];
+  for (const g of groups) {
+    if (vidClean.includes(g) && subClean.includes(g)) score += 200;
+  }
 
-app.get('/api/profiles/list', (req, res) => {
-  res.json({ profiles: Object.keys(savedProfiles) });
-});
+  const sources = ['web-dl', 'webdl', 'webrip', 'web', 'bluray', 'bdrip', 'brrip', 'hdtv', 'dvdrip', 'remux'];
+  for (const s of sources) {
+    if (vidClean.includes(s) && subClean.includes(s)) score += 120;
+  }
 
-// ----------------------------------------------------
-// Manifest Routes
-// ----------------------------------------------------
-app.get(['/manifest.json', '/p/:profile/manifest.json', '/:param/manifest.json'], (req, res) => {
-  const param = req.params.profile || req.params.param || '';
-  const config = parseConfig(param);
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.json(getManifest(config));
-});
+  const res = ['2160p', '4k', '1080p', '720p', '480p'];
+  for (const r of res) {
+    if (vidClean.includes(r) && subClean.includes(r)) score += 60;
+  }
+
+  const codecs = ['x264', 'h264', 'x265', 'h265', 'hevc', 'av1', '10bit'];
+  for (const c of codecs) {
+    if (vidClean.includes(c) && subClean.includes(c)) score += 40;
+  }
+
+  const vidTokens = new Set(vidClean.split(/\s+/).filter(w => w.length > 2));
+  const subTokens = new Set(subClean.split(/\s+/).filter(w => w.length > 2));
+  let overlap = 0;
+  for (const t of vidTokens) {
+    if (subTokens.has(t)) overlap++;
+  }
+  score += overlap * 10;
+
+  return score;
+}
 
 // ----------------------------------------------------
 // Verification Endpoints
 // ----------------------------------------------------
+app.post('/api/verify-torbox', async (req, res) => {
+  const { apiKey } = req.body;
+  if (!apiKey) return res.status(400).json({ valid: false, error: 'TorBox API key required' });
+
+  try {
+    const resp = await fetch('https://api.torbox.app/v1/api/user/me', {
+      headers: { 'Authorization': `Bearer ${apiKey.trim()}` },
+      signal: AbortSignal.timeout(6000)
+    });
+    const data = await resp.json();
+    if (resp.ok && data.success) {
+      return res.json({ valid: true, user: data.data?.email || 'TorBox Pro' });
+    }
+    return res.status(400).json({ valid: false, error: data.detail || 'Invalid TorBox Key' });
+  } catch (err) {
+    return res.status(500).json({ valid: false, error: err.message });
+  }
+});
+
 app.post('/api/verify-opensubtitles', async (req, res) => {
   const { apiKey, username, password } = req.body;
   if (!apiKey) return res.status(400).json({ valid: false, error: 'API Key is required' });
@@ -140,7 +174,7 @@ app.post('/api/verify-opensubtitles', async (req, res) => {
     const testRes = await fetch('https://api.opensubtitles.com/api/v1/subtitles?imdb_id=0111161&languages=en', {
       headers: {
         'Api-Key': apiKey,
-        'User-Agent': 'AISUBS v2.3.0',
+        'User-Agent': 'AISUBS v2.5.0',
         'Accept': 'application/json'
       },
       signal: AbortSignal.timeout(7000)
@@ -155,7 +189,7 @@ app.post('/api/verify-opensubtitles', async (req, res) => {
         method: 'POST',
         headers: {
           'Api-Key': apiKey,
-          'User-Agent': 'AISUBS v2.3.0',
+          'User-Agent': 'AISUBS v2.5.0',
           'Content-Type': 'application/json',
           'Accept': 'application/json'
         },
@@ -253,8 +287,55 @@ app.post('/api/verify-ai', async (req, res) => {
   }
 });
 
+app.post('/api/profiles/save', (req, res) => {
+  const { name, config } = req.body;
+  if (!name || !config) return res.status(400).json({ error: 'Name and config required' });
+
+  const slug = name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').slice(0, 32);
+  savedProfiles[slug] = config;
+  persistProfiles();
+
+  res.json({ success: true, slug, url: `${req.protocol}://${req.get('host')}/p/${slug}/manifest.json` });
+});
+
+// Tool: Translate Extracted/Embedded File Directly
+app.post('/api/tool/translate-direct', async (req, res) => {
+  const { text, targetLang = 'Dutch', apiKey = ENV_GEMINI_KEY } = req.body;
+  if (!text) return res.status(400).json({ error: 'Subtitle text is required' });
+
+  try {
+    const cues = parseSubtitleCues(text);
+    if (!cues || cues.length === 0) return res.status(400).json({ error: 'No cues found' });
+
+    const batchSize = 50;
+    for (let i = 0; i < cues.length; i += batchSize) {
+      const chunk = cues.slice(i, i + batchSize);
+      const texts = chunk.map(c => c.text);
+      const translated = await translateBatch(texts, targetLang, { provider: 'gemini', apiKey, model: 'gemini-2.0-flash' });
+      chunk.forEach((c, idx) => {
+        c.text = translated[idx] || c.text;
+      });
+    }
+
+    const vtt = buildWebVTT(cues, `[ 🤖 AISUBS: Extracted Embedded Subtitle Translated to ${targetLang} ]`);
+    res.json({ success: true, vtt });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ----------------------------------------------------
-// Subtitle Discovery & Multi-Provider Candidate Assembly
+// Manifest Routes
+// ----------------------------------------------------
+app.get(['/manifest.json', '/p/:profile/manifest.json', '/:param/manifest.json'], (req, res) => {
+  const param = req.params.profile || req.params.param || '';
+  const config = parseConfig(param);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.json(getManifest(config));
+});
+
+// ----------------------------------------------------
+// Subtitle Discovery: Release-Scoring & Embedded Search
 // ----------------------------------------------------
 app.use(async (req, res, next) => {
   if (!req.path.includes('/subtitles/')) return next();
@@ -286,13 +367,46 @@ app.use(async (req, res, next) => {
 
   console.log(`\n[AISUBS-DISCOVERY] ${mediaType} ${fullId} | Hash: ${videoHash || 'None'} | File: ${filename || 'None'}`);
 
-  let referenceEnSubs = [];
-  let nativeTargetSubs = [];
-
+  let candidateSubs = [];
   const targetIso3 = config.lang || 'nld';
-  const targetIso1 = targetIso3 === 'nld' ? 'nl' : targetIso3.slice(0, 2);
+  const targetIso1 = targetIso3 === 'nld' || targetIso3 === 'dut' ? 'nl' : targetIso3.slice(0, 2);
 
-  // 1. OpenSubtitles v3 Public Proxy (Stremio Official CDN - Always Included)
+  // 1. TorBox Embedded Subtitle Retrieval
+  if (config.torboxApiKey && filename) {
+    try {
+      console.log(`[AISUBS] Checking TorBox embedded tracks for: ${filename}...`);
+      const tbRes = await fetch('https://api.torbox.app/v1/api/torrents/mylist', {
+        headers: { 'Authorization': `Bearer ${config.torboxApiKey.trim()}` },
+        signal: AbortSignal.timeout(3500)
+      });
+      if (tbRes.ok) {
+        const tbData = await tbRes.json();
+        if (Array.isArray(tbData.data)) {
+          for (const item of tbData.data) {
+            if (Array.isArray(item.files)) {
+              for (const f of item.files) {
+                if (f.name && (f.name.includes(filename) || filename.includes(f.name))) {
+                  candidateSubs.push({
+                    source: 'TorBox Embedded',
+                    release: 'Embedded Video Track',
+                    isHashMatch: true,
+                    isEmbedded: true,
+                    score: 2000,
+                    lang: 'eng',
+                    url: `https://api.torbox.app/v1/api/torrents/requestdl?token=${config.torboxApiKey.trim()}&torrent_id=${item.id}&file_id=${f.id}`
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[AISUBS] TorBox check warning:', e.message);
+    }
+  }
+
+  // 2. OpenSubtitles v3 Public Proxy (Stremio Official CDN)
   try {
     let pubUrl = `https://opensubtitles-v3.strem.io/subtitles/${mediaType}/${fullId}`;
     if (extraStr) pubUrl += `/${extraStr}`;
@@ -307,17 +421,25 @@ app.use(async (req, res, next) => {
       const pubData = await pubRes.json();
       if (Array.isArray(pubData.subtitles)) {
         pubData.subtitles.forEach(s => {
-          const isTarget = s.lang === targetIso3 || s.lang === targetIso1 || (targetIso3 === 'nld' && s.lang === 'dut');
-          const isEnglish = s.lang === 'eng' || s.lang === 'en';
+          const subLang = s.lang;
+          const isTarget = subLang === targetIso3 || subLang === targetIso1 || (targetIso3 === 'nld' && subLang === 'dut');
+          const isEnglish = subLang === 'eng' || subLang === 'en';
 
-          const subObj = {
-            source: 'OpenSubtitles-v3',
-            release: filename || 'Synced Video File',
-            isHashMatch: !!videoHash,
-            url: s.url
-          };
-          if (isTarget) nativeTargetSubs.push(subObj);
-          else if (isEnglish) referenceEnSubs.push(subObj);
+          if (isTarget || isEnglish) {
+            const release = s.id || filename || 'Video';
+            const isHash = !!videoHash;
+            const score = scoreSubtitleMatch(release, filename || '', isHash);
+
+            candidateSubs.push({
+              source: 'OpenSubtitles-v3',
+              release,
+              isHashMatch: isHash,
+              isEmbedded: false,
+              score,
+              lang: subLang,
+              url: s.url
+            });
+          }
         });
       }
     }
@@ -325,7 +447,7 @@ app.use(async (req, res, next) => {
     console.warn('[AISUBS] OpenSubtitles v3 lookup warning:', e.message);
   }
 
-  // 2. OpenSubtitles API (When API key is provided)
+  // 3. OpenSubtitles API (When API key is provided)
   if (config.osApiKey) {
     try {
       let osUrl = `https://api.opensubtitles.com/api/v1/subtitles?imdb_id=${imdbId.replace('tt', '')}&languages=${targetIso1},en`;
@@ -335,7 +457,7 @@ app.use(async (req, res, next) => {
       const osRes = await fetch(osUrl, {
         headers: {
           'Api-Key': config.osApiKey,
-          'User-Agent': 'AISUBS v2.3.0',
+          'User-Agent': 'AISUBS v2.5.0',
           'Accept': 'application/json'
         },
         signal: AbortSignal.timeout(3500)
@@ -347,31 +469,33 @@ app.use(async (req, res, next) => {
           json.data.forEach(item => {
             const fileId = item.attributes?.files?.[0]?.file_id;
             const langCode = item.attributes?.language;
-            const release = item.attributes?.release || filename || 'Video Release';
+            const release = item.attributes?.release || filename || 'Release';
             const isHashMatch = item.attributes?.moviehash_match === true;
+            const score = scoreSubtitleMatch(release, filename || '', isHashMatch);
 
             if (fileId) {
-              const subObj = {
+              candidateSubs.push({
                 source: 'OpenSubtitles',
                 release,
                 isHashMatch,
+                isEmbedded: false,
+                score,
+                lang: langCode,
                 url: `https://api.opensubtitles.com/api/v1/download?file_id=${fileId}&osApiKey=${config.osApiKey}`
-              };
-              if (langCode === targetIso1) nativeTargetSubs.push(subObj);
-              else if (langCode === 'en') referenceEnSubs.push(subObj);
+              });
             }
           });
         }
       }
     } catch (e) {
-      console.warn('[AISUBS] OpenSubtitles API warning:', e.message);
+      console.warn('[AISUBS] OpenSubtitles API error:', e.message);
     }
   }
 
-  // 3. SubDL API (When configured)
+  // 4. SubDL API Fallback
   if (config.subdlApiKey) {
     try {
-      let subdlUrl = `https://api.subdl.com/api/v1/subtitles?api_key=${config.subdlApiKey}&imdb_id=${imdbId}&languages=EN,${targetIso1.toUpperCase()}&subs_per_page=4`;
+      let subdlUrl = `https://api.subdl.com/api/v1/subtitles?api_key=${config.subdlApiKey}&imdb_id=${imdbId}&languages=EN,${targetIso1.toUpperCase()}&subs_per_page=5`;
       if (season && episode) subdlUrl += `&season_number=${season}&episode_number=${episode}&type=tv`;
 
       const dlRes = await fetch(subdlUrl, { signal: AbortSignal.timeout(3500) });
@@ -380,54 +504,73 @@ app.use(async (req, res, next) => {
         if (Array.isArray(dlJson.subtitles)) {
           dlJson.subtitles.forEach(s => {
             const fullUrl = s.url.startsWith('http') ? s.url : `https://dl.subdl.com${s.url}`;
-            const subObj = {
+            const release = s.release_name || filename || 'Release';
+            const score = scoreSubtitleMatch(release, filename || '', false);
+
+            candidateSubs.push({
               source: 'SubDL',
-              release: s.release_name || filename || 'Release',
+              release,
               isHashMatch: false,
+              isEmbedded: false,
+              score,
+              lang: s.lang?.toLowerCase() === targetIso1 ? targetIso1 : 'en',
               url: fullUrl
-            };
-            if (s.lang?.toLowerCase() === targetIso1) nativeTargetSubs.push(subObj);
-            else referenceEnSubs.push(subObj);
+            });
           });
         }
       }
     } catch (e) {
-      console.warn('[AISUBS] SubDL warning:', e.message);
+      console.warn('[AISUBS] SubDL error:', e.message);
     }
   }
+
+  // Sort candidate subtitles strictly by release score
+  const rankedEn = candidateSubs
+    .filter(s => s.lang === 'eng' || s.lang === 'en')
+    .sort((a, b) => b.score - a.score);
+
+  const rankedTarget = candidateSubs
+    .filter(s => s.lang === targetIso3 || s.lang === targetIso1 || (targetIso3 === 'nld' && s.lang === 'dut'))
+    .sort((a, b) => b.score - a.score);
 
   const cfgString = Buffer.from(JSON.stringify(config)).toString('base64url');
   const targetName = config.langName || 'Dutch';
   const outSubtitles = [];
 
-  // Pass mediaType and fullId so /sub.vtt can perform a live rescue fetch if direct downloads fail
-  if (referenceEnSubs.length > 0) {
-    const refSub = referenceEnSubs[0];
-    const altSub = referenceEnSubs[1];
-    const syncBadge = refSub.isHashMatch ? '✓ Synced' : '⏳ Auto-Sync';
+  // Top Track: Synchronized reference subtitle translated to Dutch
+  if (rankedEn.length > 0) {
+    const bestRef = rankedEn[0];
+    const altRef = rankedEn[1] || null;
 
-    const srcParam = encodeSourceParam(refSub.url);
-    const altParam = altSub ? encodeSourceParam(altSub.url) : '';
+    const syncLabel = bestRef.isEmbedded
+      ? `✓ Synced [Embedded Track → ${targetName}]`
+      : (bestRef.score >= 200 || bestRef.isHashMatch
+        ? `✓ Synced [Release Match → ${targetName}]`
+        : `⏳ Auto-Sync [AI ${targetName}]`);
+
+    const srcParam = encodeSourceParam(bestRef.url);
+    const altParam = altRef ? encodeSourceParam(altRef.url) : '';
 
     outSubtitles.push({
-      id: `aisubs-ai-ref-0`,
+      id: `aisubs-ai-top`,
       url: `${host}/sub.vtt?cfg=${cfgString}&type=${mediaType}&id=${fullId}&hash=${videoHash || ''}&src=${srcParam}&alt=${altParam}&synced=true`,
       lang: targetIso3,
-      label: `${syncBadge} [AI ${targetName}] · Gemini · ${refSub.release}`
+      label: `${syncLabel} · Gemini · ${bestRef.release}`
     });
 
-    if (referenceEnSubs.length > 1) {
+    if (altRef) {
       outSubtitles.push({
-        id: `aisubs-ai-ref-1`,
+        id: `aisubs-ai-alt`,
         url: `${host}/sub.vtt?cfg=${cfgString}&type=${mediaType}&id=${fullId}&hash=${videoHash || ''}&src=${altParam}&synced=true`,
         lang: targetIso3,
-        label: `⏳ Sync Alternate [AI ${targetName}] · ${altSub.source}`
+        label: `⏳ Alternate Match [AI ${targetName}] · ${altRef.source} (${altRef.release})`
       });
     }
   }
 
-  if (nativeTargetSubs.length > 0) {
-    const topNative = nativeTargetSubs[0];
+  // Second Track: Native target language subtitle (if an exact match exists)
+  if (rankedTarget.length > 0) {
+    const topNative = rankedTarget[0];
     const srcParam = encodeSourceParam(topNative.url);
     outSubtitles.push({
       id: `aisubs-native-0`,
@@ -447,12 +590,10 @@ app.use(async (req, res, next) => {
 async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId) {
   let lastError = null;
 
-  // 1. Iterate over candidate URLs
   for (let rawUrl of candidateUrls) {
     if (!rawUrl) continue;
     let targetUrl = rawUrl;
 
-    // Handle OpenSubtitles download resolution
     if (targetUrl.includes('api.opensubtitles.com/api/v1/download')) {
       try {
         const u = new URL(targetUrl);
@@ -462,7 +603,7 @@ async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId) {
           method: 'POST',
           headers: {
             'Api-Key': apiKey,
-            'User-Agent': 'AISUBS v2.3.0',
+            'User-Agent': 'AISUBS v2.5.0',
             'Content-Type': 'application/json',
             'Accept': 'application/json'
           },
@@ -504,9 +645,9 @@ async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId) {
     }
   }
 
-  // 2. Live Rescue Fallback: Query Stremio OpenSubtitles v3 CDN directly
+  // Live Rescue Fallback via Stremio CDN
   if (mediaType && fullId) {
-    console.log(`[AISUBS] Primary links failed. Initiating Live Rescue for ${mediaType} ${fullId}...`);
+    console.log(`[AISUBS] Initiating Live Rescue for ${mediaType} ${fullId}...`);
     try {
       const rescueUrl = `https://opensubtitles-v3.strem.io/subtitles/${mediaType}/${fullId}.json`;
       const rescueRes = await fetch(rescueUrl, {
@@ -551,7 +692,6 @@ async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId) {
 // Decompression Engine
 // ----------------------------------------------------
 function decompressSubtitleBuffer(buffer) {
-  // 1. Gzip Stream (0x1f 0x8b)
   if (buffer.length > 2 && buffer[0] === 0x1f && buffer[1] === 0x8b) {
     try {
       return decodeText(zlib.gunzipSync(buffer));
@@ -562,7 +702,6 @@ function decompressSubtitleBuffer(buffer) {
     }
   }
 
-  // 2. PKZip Archive ('PK\x03\x04')
   if (buffer.length > 4 && buffer[0] === 0x50 && buffer[1] === 0x4b && buffer[2] === 0x03 && buffer[3] === 0x04) {
     try {
       let offset = 0;
@@ -916,6 +1055,6 @@ function shiftTimestamp(ts, offsetMs) {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[AISUBS] Server running on port ${PORT}`);
-  console.log(`[AISUBS] Default language: ${ISO_LANG_MAP[ENV_TARGET_LANG]} (${ENV_TARGET_LANG})`);
+  console.log(`[AISUBS] Target language default: ${ISO_LANG_MAP[ENV_TARGET_LANG]} (${ENV_TARGET_LANG})`);
   if (ENV_GEMINI_KEY) console.log('[AISUBS] Server-level GEMINI_API_KEY detected.');
 });
