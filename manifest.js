@@ -1,13 +1,17 @@
 export function getManifest(config = {}) {
+  const lang = (config.lang || 'nld').toLowerCase();
   const langName = config.langName || 'Dutch';
   return {
-    id: 'org.aisubs.translator',
-    version: '2.5.0',
+    // Stremio identifies addons by id. One id per target language so a Dutch and a
+    // Spanish install don't overwrite each other.
+    id: `org.aisubs.translator.${lang}`,
+    version: '2.5.1',
     name: `AISUBS (${langName})`,
     description: 'Auto-synced subtitles matched to your exact video release & translated with Gemini AI.',
     resources: ['subtitles'],
     types: ['movie', 'series'],
-    idPrefixes: ['tt', 'kitsu'],
+    // Only IMDb ids ("tt1234567" / "tt1234567:1:2") are supported by the providers used in server.js.
+    idPrefixes: ['tt'],
     catalogs: [],
     behaviorHints: {
       configurable: true,
