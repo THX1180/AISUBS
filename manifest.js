@@ -2,9 +2,9 @@ export function getManifest(config = {}) {
   const langName = config.langName || 'Dutch';
   return {
     id: 'org.aisubs.translator',
-    version: '2.0.0',
+    version: '2.5.0',
     name: `AISUBS (${langName})`,
-    description: 'Auto-synced and AI-translated subtitles for Stremio & Nuvio, timed to your exact video file.',
+    description: 'Auto-synced subtitles matched to your exact video release & translated with Gemini AI.',
     resources: ['subtitles'],
     types: ['movie', 'series'],
     idPrefixes: ['tt', 'kitsu'],
