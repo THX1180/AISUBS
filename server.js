@@ -8,7 +8,6 @@ import { getManifest } from './manifest.js';
 const app = express();
 const PORT = process.env.PORT || 7860;
 
-// Strict Dutch default
 const ENV_GEMINI_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
 const ENV_TARGET_LANG = process.env.TARGET_LANG || 'nld';
 
@@ -64,7 +63,12 @@ function parseConfig(raw) {
     model: 'gemini-2.0-flash',
     offsetMs: 0,
     bilingual: false,
-    torboxApiKey: ''
+    torboxApiKey: '',
+    osApiKey: '',
+    osUsername: '',
+    osPassword: '',
+    subdlApiKey: '',
+    subsourceApiKey: ''
   };
 
   if (!raw) return baseDefault;
@@ -104,7 +108,7 @@ function decodeSourceParam(param) {
 }
 
 // ----------------------------------------------------
-// Smart Release-Matching Scoring (Guarantees Sync)
+// Scene Release Matching & Scoring Algorithm
 // ----------------------------------------------------
 function scoreSubtitleMatch(subReleaseName, videoFilename, isHashMatch = false) {
   if (isHashMatch) return 1000;
@@ -298,32 +302,6 @@ app.post('/api/profiles/save', (req, res) => {
   res.json({ success: true, slug, url: `${req.protocol}://${req.get('host')}/p/${slug}/manifest.json` });
 });
 
-// Tool: Translate Extracted/Embedded File Directly
-app.post('/api/tool/translate-direct', async (req, res) => {
-  const { text, targetLang = 'Dutch', apiKey = ENV_GEMINI_KEY } = req.body;
-  if (!text) return res.status(400).json({ error: 'Subtitle text is required' });
-
-  try {
-    const cues = parseSubtitleCues(text);
-    if (!cues || cues.length === 0) return res.status(400).json({ error: 'No cues found' });
-
-    const batchSize = 50;
-    for (let i = 0; i < cues.length; i += batchSize) {
-      const chunk = cues.slice(i, i + batchSize);
-      const texts = chunk.map(c => c.text);
-      const translated = await translateBatch(texts, targetLang, { provider: 'gemini', apiKey, model: 'gemini-2.0-flash' });
-      chunk.forEach((c, idx) => {
-        c.text = translated[idx] || c.text;
-      });
-    }
-
-    const vtt = buildWebVTT(cues, `[ 🤖 AISUBS: Extracted Embedded Subtitle Translated to ${targetLang} ]`);
-    res.json({ success: true, vtt });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // ----------------------------------------------------
 // Manifest Routes
 // ----------------------------------------------------
@@ -335,7 +313,7 @@ app.get(['/manifest.json', '/p/:profile/manifest.json', '/:param/manifest.json']
 });
 
 // ----------------------------------------------------
-// Subtitle Discovery: Release-Scoring & Embedded Search
+// Subtitle Discovery: Release-Scoring & Embedded Sync
 // ----------------------------------------------------
 app.use(async (req, res, next) => {
   if (!req.path.includes('/subtitles/')) return next();
@@ -371,10 +349,10 @@ app.use(async (req, res, next) => {
   const targetIso3 = config.lang || 'nld';
   const targetIso1 = targetIso3 === 'nld' || targetIso3 === 'dut' ? 'nl' : targetIso3.slice(0, 2);
 
-  // 1. TorBox Embedded Subtitle Retrieval
+  // 1. TorBox Embedded Subtitles (Direct from Video Container)
   if (config.torboxApiKey && filename) {
     try {
-      console.log(`[AISUBS] Checking TorBox embedded tracks for: ${filename}...`);
+      console.log(`[AISUBS] Checking TorBox embedded streams for: ${filename}...`);
       const tbRes = await fetch('https://api.torbox.app/v1/api/torrents/mylist', {
         headers: { 'Authorization': `Bearer ${config.torboxApiKey.trim()}` },
         signal: AbortSignal.timeout(3500)
@@ -402,7 +380,7 @@ app.use(async (req, res, next) => {
         }
       }
     } catch (e) {
-      console.warn('[AISUBS] TorBox check warning:', e.message);
+      console.warn('[AISUBS] TorBox check error:', e.message);
     }
   }
 
@@ -447,7 +425,7 @@ app.use(async (req, res, next) => {
     console.warn('[AISUBS] OpenSubtitles v3 lookup warning:', e.message);
   }
 
-  // 3. OpenSubtitles API (When API key is provided)
+  // 3. OpenSubtitles API (When API key configured)
   if (config.osApiKey) {
     try {
       let osUrl = `https://api.opensubtitles.com/api/v1/subtitles?imdb_id=${imdbId.replace('tt', '')}&languages=${targetIso1},en`;
