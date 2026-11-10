@@ -26,6 +26,15 @@ const PORT = process.env.PORT || 7860;
 const ENV_GEMINI_KEY = process.env.GEMINI_API_KEY || process.env.GEMINI_KEY || '';
 const ENV_TARGET_LANG = process.env.TARGET_LANG || 'nld';
 
+// gemini-2.0-flash was shut down 2026-06-01 and gemini-1.5/2.5 are gone too. Any retired id that an old
+// install URL, saved profile or the UI still sends is remapped, otherwise every call returns 404.
+const GEMINI_DEFAULT_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+const GEMINI_FALLBACK_MODELS = ['gemini-3.5-flash', 'gemini-3.1-flash-lite'];
+const RETIRED_GEMINI = /^gemini-(1\.5|2\.0|2\.5)/;
+function resolveGeminiModel(m) {
+  return !m || m === 'default' || RETIRED_GEMINI.test(m) ? GEMINI_DEFAULT_MODEL : m;
+}
+
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
 // Serve ONLY the UI files. express.static('.') used to expose profiles.json (API keys) and server.js.
@@ -93,7 +102,7 @@ function parseConfig(raw) {
     langName: 'Dutch',
     provider: ENV_GEMINI_KEY ? 'gemini' : 'gemini',
     apiKey: ENV_GEMINI_KEY,
-    model: 'gemini-2.0-flash',
+    model: GEMINI_DEFAULT_MODEL,
     offsetMs: 0,
     bilingual: false,
     torboxApiKey: '',
@@ -749,6 +758,8 @@ function padAssTime(t) {
 // Subtitle Stream & Translation Delivery (/sub.vtt)
 // ----------------------------------------------------
 async function generateVtt({ config, candidates, type, id, raw }) {
+  const ctx = { errors: [] };
+  let missed = 0;
   const { buffer } = await downloadSubtitleWithFallbacks(candidates, type, id, config);
   const cues = parseSubtitleCues(decompressSubtitleBuffer(buffer));
   if (!cues || cues.length === 0) throw new Error('No subtitle cues found after decompression');
@@ -768,17 +779,27 @@ async function generateVtt({ config, candidates, type, id, raw }) {
 
     await mapPool(batches, TRANSLATE_CONCURRENCY, async (chunk, bi) => {
       console.log(`[AISUBS] Translating batch ${bi + 1}/${batches.length} (${chunk.length} lines)...`);
-      const translated = await translateBatch(chunk.map(c => c.text), config.langName || 'Dutch', config);
+      const translated = await translateBatch(chunk.map(c => c.text), config.langName || 'Dutch', config, ctx);
       chunk.forEach((c, idx) => {
-        const trans = translated[idx] || c.text;
+        const trans = translated[idx];
+        if (trans == null) { missed++; return; }      // keep the original line, but remember it failed
         c.text = config.bilingual ? `${c.text}\n<c.cyan>${trans}</c>` : trans;
       });
     });
   }
 
+  const targetName = config.langName || 'Dutch';
   const providerName = config.provider === 'gemini' ? 'Gemini AI' : String(config.provider).toUpperCase();
-  const banner = raw === 'true' ? '' : `[ 🤖 AISUBS: Translated to ${config.langName || 'Dutch'} via ${providerName} ]`;
-  return buildWebVTT(cues, banner);
+
+  if (raw !== 'true' && missed > cues.length * 0.2) {
+    const reason = (ctx.errors[0] || 'unknown error').slice(0, 140);
+    console.error(`[AISUBS] Translation failed for ${missed}/${cues.length} cues. First error: ${reason}`);
+    const banner = `[ ⚠ AISUBS: translation to ${targetName} failed - showing original. ${reason} ]`;
+    return { vtt: buildWebVTT(cues, banner), cacheable: false };   // don't cache a failure
+  }
+
+  const banner = raw === 'true' ? '' : `[ 🤖 AISUBS: Translated to ${targetName} via ${providerName} ]`;
+  return { vtt: buildWebVTT(cues, banner), cacheable: true };
 }
 
 app.get('/sub.vtt', async (req, res) => {
@@ -800,8 +821,8 @@ app.get('/sub.vtt', async (req, res) => {
       inflight.set(cacheKey, job);
       job.finally(() => inflight.delete(cacheKey)).catch(() => {});
     }
-    const vtt = await job;
-    setInCache(cacheKey, vtt);
+    const { vtt, cacheable } = await job;
+    if (cacheable) setInCache(cacheKey, vtt);
     res.send(vtt);
   } catch (err) {
     console.error('[AISUBS] Stream error:', err.message);
@@ -810,41 +831,40 @@ app.get('/sub.vtt', async (req, res) => {
 });
 
 // Translation Routing
-async function translateBatch(texts, targetLang, config) {
+// Every function returns an array aligned with `texts`; an entry is null when that line could NOT be
+// translated. Callers must never silently substitute the original text (that is what hid the failures).
+async function translateBatch(texts, targetLang, config, ctx = { errors: [] }) {
   const apiKey = (config.apiKey || ENV_GEMINI_KEY || '').trim();
   const provider = config.provider || 'gemini';
-  const model = config.model || 'gemini-2.0-flash';
 
   if (provider === 'gemini' && apiKey) {
-    return translateWithGemini(texts, targetLang, apiKey, model);
+    return translateWithGemini(texts, targetLang, apiKey, resolveGeminiModel(config.model), ctx);
   }
   if (['openrouter', 'openai', 'groq', 'deepseek'].includes(provider) && apiKey) {
-    return translateWithOpenAICompatible(texts, targetLang, provider, apiKey, model);
+    return translateWithOpenAICompatible(texts, targetLang, provider, apiKey, config.model, ctx);
   }
 
-  console.warn('[AISUBS] No AI key provided. Using free web fallback...');
-  return translateWithFreeFallback(texts, targetLang);
+  ctx.errors.push(apiKey ? `unknown provider "${provider}"` : 'no AI API key configured');
+  return translateWithFreeFallback(texts, targetLang, ctx);
 }
 
-async function translateWithGemini(texts, targetLang, apiKey, model) {
-  const modelsToTry = [
-    model && model !== 'default' ? model : 'gemini-2.0-flash',
-    'gemini-1.5-flash'
-  ];
-
-  const prompt = `You are a film and television subtitle translator.
+function buildPrompt(texts, targetLang) {
+  return `You are a film and television subtitle translator.
 Translate the following numbered dialogue lines into ${targetLang}.
 Preserve line numbers and the '|' delimiter. Example format: '1| Translated line'.
 Maintain the exact natural dialogue, timing brevity, and tone.
 Return ONLY the numbered list of translations, with NO intro, markdown fences, or outro:
 
 ${texts.map((t, idx) => `${idx + 1}| ${t.replace(/\n/g, ' ')}`).join('\n')}`;
+}
+
+async function translateWithGemini(texts, targetLang, apiKey, model, ctx) {
+  const modelsToTry = [...new Set([model, ...GEMINI_FALLBACK_MODELS])];
+  const prompt = buildPrompt(texts, targetLang);
 
   for (const m of modelsToTry) {
     try {
-      console.log(`[AISUBS] Calling Gemini API (${m})...`);
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${apiKey}`;
-
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -852,33 +872,42 @@ ${texts.map((t, idx) => `${idx + 1}| ${t.replace(/\n/g, ' ')}`).join('\n')}`;
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: { temperature: 0.15 }
         }),
-        signal: AbortSignal.timeout(12000)
+        signal: AbortSignal.timeout(25000)
       });
 
       if (!res.ok) {
-        const errorBody = await res.text();
-        console.warn(`[AISUBS] Gemini ${m} HTTP ${res.status}:`, errorBody.slice(0, 140));
-        continue;
+        const body = (await res.text()).slice(0, 160).replace(/\s+/g, ' ');
+        const msg = `Gemini ${m} HTTP ${res.status}: ${body}`;
+        console.warn(`[AISUBS] ${msg}`);
+        ctx.errors.push(msg);
+        continue;                      // try the next model
       }
 
       const data = await res.json();
-      const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const parts = data.candidates?.[0]?.content?.parts || [];
+      const reply = parts.filter(p => p.text && !p.thought).map(p => p.text).join('');
+      if (!reply.trim()) {
+        const why = data.promptFeedback?.blockReason || data.candidates?.[0]?.finishReason || 'empty reply';
+        ctx.errors.push(`Gemini ${m}: ${why}`);
+        continue;
+      }
       return parseNumberedReply(reply, texts);
     } catch (e) {
       console.warn(`[AISUBS] Gemini ${m} error:`, e.message);
+      ctx.errors.push(`Gemini ${m}: ${e.message}`);
     }
   }
 
-  return translateWithFreeFallback(texts, targetLang);
+  return translateWithFreeFallback(texts, targetLang, ctx);
 }
 
-async function translateWithOpenAICompatible(texts, targetLang, provider, apiKey, model) {
+async function translateWithOpenAICompatible(texts, targetLang, provider, apiKey, model, ctx) {
   let endpoint = 'https://api.openai.com/v1/chat/completions';
   let defaultModel = 'gpt-4o-mini';
 
   if (provider === 'openrouter') {
     endpoint = 'https://openrouter.ai/api/v1/chat/completions';
-    defaultModel = 'google/gemini-2.0-flash-001';
+    defaultModel = 'google/gemini-3.6-flash';   // NOTE: verify this id on openrouter.ai/models
   } else if (provider === 'groq') {
     endpoint = 'https://api.groq.com/openai/v1/chat/completions';
     defaultModel = 'llama-3.3-70b-versatile';
@@ -887,43 +916,58 @@ async function translateWithOpenAICompatible(texts, targetLang, provider, apiKey
     defaultModel = 'deepseek-chat';
   }
 
-  const chosenModel = model && model !== 'default' ? model : defaultModel;
-  const prompt = `Translate dialogue cues into ${targetLang}. Return ONLY lines formatted as [index]| [translated line]:\n\n${texts.map((t, idx) => `${idx + 1}| ${t.replace(/\n/g, ' ')}`).join('\n')}`;
+  // The UI/old profiles may still send a retired Gemini id as the model; don't forward it to other providers.
+  const chosenModel = model && model !== 'default' && !RETIRED_GEMINI.test(model) ? model : defaultModel;
+  const prompt = buildPrompt(texts, targetLang);
 
   try {
     const res = await fetch(endpoint, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: chosenModel,
         temperature: 0.1,
         messages: [{ role: 'user', content: prompt }]
       }),
-      signal: AbortSignal.timeout(12000)
+      signal: AbortSignal.timeout(25000)
     });
+
+    if (!res.ok) {
+      const body = (await res.text()).slice(0, 160).replace(/\s+/g, ' ');
+      const msg = `${provider} ${chosenModel} HTTP ${res.status}: ${body}`;
+      console.warn(`[AISUBS] ${msg}`);
+      ctx.errors.push(msg);
+      return translateWithFreeFallback(texts, targetLang, ctx);
+    }
 
     const data = await res.json();
     const reply = data.choices?.[0]?.message?.content || '';
+    if (!reply.trim()) {
+      ctx.errors.push(`${provider}: empty reply`);
+      return translateWithFreeFallback(texts, targetLang, ctx);
+    }
     return parseNumberedReply(reply, texts);
   } catch (e) {
     console.error(`[AISUBS] ${provider} error:`, e.message);
-    return translateWithFreeFallback(texts, targetLang);
+    ctx.errors.push(`${provider}: ${e.message}`);
+    return translateWithFreeFallback(texts, targetLang, ctx);
   }
 }
 
-async function translateWithFreeFallback(texts, targetLang) {
+async function translateWithFreeFallback(texts, targetLang, ctx = { errors: [] }) {
   const iso1 = targetLang.toLowerCase() === 'dutch' ? 'nl' : targetLang.slice(0, 2).toLowerCase();
   return mapPool(texts, 8, async (text) => {
     try {
       const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${iso1}&dt=t&q=${encodeURIComponent(text)}`;
-      const r = await fetch(url, { signal: AbortSignal.timeout(2500) });
+      const r = await fetch(url, { signal: AbortSignal.timeout(4000) });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const json = await r.json();
-      return json[0]?.map(p => p[0]).join('') || text;
-    } catch {
-      return text;
+      return json[0]?.map(p => p[0]).join('') || null;
+    } catch (e) {
+      if (ctx.errors.length < 6 && !ctx.errors.some(x => x.startsWith('free fallback'))) {
+        ctx.errors.push(`free fallback: ${e.message}`);
+      }
+      return null;
     }
   });
 }
@@ -937,7 +981,7 @@ function parseNumberedReply(reply, original) {
     const match = line.match(/^(\d+)\s*[\|\.\:\-\)]\s*(.*)$/);
     if (match) map.set(parseInt(match[1], 10), match[2].trim());
   }
-  return original.map((orig, idx) => map.get(idx + 1) || orig);
+  return original.map((_, idx) => map.get(idx + 1) ?? null);
 }
 
 function buildWebVTT(cues, bannerText) {

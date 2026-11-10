@@ -104,8 +104,11 @@
             <span class="helper">Free key available at <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color:#818cf8;">Google AI Studio</a>.</span>
           </div>
           <div class="form-group">
-            <label for="modelInput">Model</label>
-            <input type="text" id="modelInput" value="gemini-2.0-flash" placeholder="gemini-2.0-flash">
+            <label for="modelSelect">Model</label>
+            <div class="select-wrapper">
+              <select id="modelSelect"></select>
+            </div>
+            <input type="text" id="modelInput" class="hidden-field" style="margin-top:0.5rem;" value="gemini-3.6-flash" placeholder="Custom model ID">
           </div>
           <button type="button" id="verifyAiBtn" class="btn btn-sm">Verify AI Key</button>
         </div>
@@ -277,6 +280,62 @@
     const subdlApiKey = document.getElementById('subdlApiKey');
     const subsourceApiKey = document.getElementById('subsourceApiKey');
 
+    // ---- Model dropdown -------------------------------------------------
+    // modelInput (hidden unless "Custom") remains the value every other function reads/saves.
+    const modelSelect = document.getElementById('modelSelect');
+    const MODEL_PRESETS = {
+      gemini: [
+        ['gemini-3.6-flash', 'Gemini 3.6 Flash (Recommended)'],
+        ['gemini-3.5-flash', 'Gemini 3.5 Flash'],
+        ['gemini-3.1-flash-lite', 'Gemini 3.1 Flash-Lite (Fastest / cheapest)']
+      ],
+      openai:     [['gpt-4o-mini', 'GPT-4o mini (Default)']],
+      groq:       [['llama-3.3-70b-versatile', 'Llama 3.3 70B (Default)']],
+      deepseek:   [['deepseek-chat', 'DeepSeek Chat (Default)']],
+      openrouter: [['default', 'Provider default']]
+    };
+    const CUSTOM_MODEL = '__custom__';
+    const RETIRED_GEMINI = /^gemini-(1\.5|2\.0|2\.5)/;
+
+    function renderModelOptions() {
+      const presets = MODEL_PRESETS[providerSelect.value] || [];
+      modelSelect.innerHTML = '';
+      presets.forEach(([value, label]) => {
+        const o = document.createElement('option');
+        o.value = value; o.textContent = label;
+        modelSelect.appendChild(o);
+      });
+      const custom = document.createElement('option');
+      custom.value = CUSTOM_MODEL; custom.textContent = 'Custom model ID…';
+      modelSelect.appendChild(custom);
+
+      const presets_ = presets.map(p => p[0]);
+      let v = modelInput.value.trim();
+      const stale = !v
+        || (providerSelect.value === 'gemini' && RETIRED_GEMINI.test(v))      // retired Gemini ids
+        || (providerSelect.value !== 'gemini' && v.startsWith('gemini-'));    // leftover from another provider
+      if (stale && presets_.length) { v = presets_[0]; modelInput.value = v; }
+
+      if (presets_.includes(v)) {
+        modelSelect.value = v;
+        modelInput.classList.add('hidden-field');
+      } else {
+        modelSelect.value = CUSTOM_MODEL;
+        modelInput.classList.remove('hidden-field');
+      }
+    }
+
+    modelSelect.addEventListener('change', () => {
+      if (modelSelect.value === CUSTOM_MODEL) {
+        modelInput.value = '';
+        modelInput.classList.remove('hidden-field');
+        modelInput.focus();
+      } else {
+        modelInput.value = modelSelect.value;
+        modelInput.classList.add('hidden-field');
+      }
+    });
+
     const PROFILE_STORAGE_KEY = 'aisubs_profiles_v3';
     const ACTIVE_PROFILE_KEY = 'aisubs_active_profile_v3';
 
@@ -293,7 +352,7 @@
         lang: 'nld|Dutch|🇳🇱',
         provider: 'gemini',
         apiKey: '',
-        model: 'gemini-2.0-flash',
+        model: 'gemini-3.6-flash',
         offsetMs: 0,
         bilingual: false,
         torboxApiKey: '',
@@ -325,7 +384,8 @@
       langSelect.value = p.lang || 'nld|Dutch|🇳🇱';
       providerSelect.value = p.provider || 'gemini';
       apiKey.value = p.apiKey || '';
-      modelInput.value = p.model || 'gemini-2.0-flash';
+      modelInput.value = p.model || 'gemini-3.6-flash';
+      renderModelOptions();
       offsetMs.value = p.offsetMs || 0;
       bilingual.checked = !!p.bilingual;
       torboxApiKey.value = p.torboxApiKey || '';
@@ -449,7 +509,11 @@
         aiCreds.classList.remove('hidden-field');
       }
     }
-    providerSelect.addEventListener('change', toggleCredentials);
+    providerSelect.addEventListener('change', () => {
+      modelInput.value = '';          // old model id is meaningless for the new provider
+      renderModelOptions();
+      toggleCredentials();
+    });
 
     // Verification calls
     async function verifyService(url, body, badgeEl, btnEl) {
@@ -534,7 +598,7 @@
         langName: langName,
         provider: providerSelect.value,
         apiKey: apiKey.value.trim(),
-        model: modelInput.value.trim() || 'gemini-2.0-flash',
+        model: modelInput.value.trim() || 'default',
         offsetMs: parseInt(offsetMs.value, 10) || 0,
         bilingual: bilingual.checked,
         torboxApiKey: torboxApiKey.value.trim(),
