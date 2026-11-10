@@ -66,7 +66,8 @@ function persistProfiles() {
 // Subtitle Cache
 const subCache = new Map();
 const inflight = new Map();   // cacheKey -> Promise<string>; stops duplicate translations when the player re-requests
-const TRANSLATE_CONCURRENCY = Number(process.env.TRANSLATE_CONCURRENCY) || 4;
+const TRANSLATE_CONCURRENCY = Number(process.env.TRANSLATE_CONCURRENCY) || 2;
+const failCache = new Map();   // cacheKey -> { vtt, until }: stops the player re-triggering a failing job in a loop
 
 async function mapPool(items, limit, fn) {
   const out = new Array(items.length);
@@ -787,7 +788,7 @@ async function generateVtt({ config, candidates, type, id, raw }) {
   }
 
   if (raw !== 'true') {
-    const batchSize = 50;
+    const batchSize = 100;
     const batches = [];
     for (let i = 0; i < cues.length; i += batchSize) batches.push(cues.slice(i, i + batchSize));
 
@@ -827,6 +828,8 @@ app.get('/sub.vtt', async (req, res) => {
 
   const cacheKey = `${primaryUrl || id}_${config.lang}_${config.provider}_${config.offsetMs}_${config.bilingual}_${raw}`;
   if (subCache.has(cacheKey)) return res.send(subCache.get(cacheKey));
+  const recentFail = failCache.get(cacheKey);
+  if (recentFail && recentFail.until > Date.now()) return res.send(recentFail.vtt);
 
   try {
     let job = inflight.get(cacheKey);
@@ -837,6 +840,7 @@ app.get('/sub.vtt', async (req, res) => {
     }
     const { vtt, cacheable } = await job;
     if (cacheable) setInCache(cacheKey, vtt);
+    else failCache.set(cacheKey, { vtt, until: Date.now() + 120000 });   // retry allowed after 2 min
     res.send(vtt);
   } catch (err) {
     console.error('[AISUBS] Stream error:', err.message);
@@ -872,46 +876,72 @@ Return ONLY the numbered list of translations, with NO intro, markdown fences, o
 ${texts.map((t, idx) => `${idx + 1}| ${t.replace(/\n/g, ' ')}`).join('\n')}`;
 }
 
+// ~15 Gemini requests/minute across the whole server (free-tier friendly). Override with GEMINI_MIN_INTERVAL_MS.
+const GEMINI_MIN_INTERVAL_MS = Number(process.env.GEMINI_MIN_INTERVAL_MS) || 4000;
+let geminiNextSlot = 0;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+async function paceGemini() {
+  const now = Date.now();
+  const start = Math.max(now, geminiNextSlot);
+  geminiNextSlot = start + GEMINI_MIN_INTERVAL_MS;
+  if (start > now) await sleep(start - now);
+}
+function retryDelayMs(res, body, attempt) {
+  const h = Number(res.headers?.get?.('retry-after'));
+  if (h > 0) return Math.min(h * 1000, 60000);
+  const m = /"retryDelay"\s*:\s*"([\d.]+)s"/.exec(body) || /retry in ([\d.]+)s/i.exec(body);
+  if (m) return Math.min(Number(m[1]) * 1000 + 500, 60000);
+  return Math.min(5000 * 2 ** attempt, 40000);
+}
+
+// Rate limits (429) and overloads (5xx) are retried on the SAME model with a wait. Falling through to other
+// models only happens when a model is unusable (404/400/403), never to dodge a rate limit.
 async function translateWithGemini(texts, targetLang, apiKey, model, ctx) {
   const modelsToTry = [...new Set([model, ...GEMINI_FALLBACK_MODELS])];
   const prompt = buildPrompt(texts, targetLang);
 
   for (const m of modelsToTry) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${apiKey}`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.15 }
-        }),
-        signal: AbortSignal.timeout(25000)
-      });
+    let again = true;
+    for (let attempt = 0; attempt < 4 && again; attempt++) {
+      again = false;
+      try {
+        await paceGemini();
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${apiKey}`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.15 } }),
+          signal: AbortSignal.timeout(45000)
+        });
 
-      if (!res.ok) {
-        const body = (await res.text()).slice(0, 160).replace(/\s+/g, ' ');
-        const msg = `Gemini ${m} HTTP ${res.status}: ${body}`;
-        console.warn(`[AISUBS] ${msg}`);
-        ctx.errors.push(msg);
-        continue;                      // try the next model
-      }
+        if (!res.ok) {
+          const body = (await res.text()).replace(/\s+/g, ' ');
+          const msg = `Gemini ${m} HTTP ${res.status}: ${body.slice(0, 160)}`;
+          console.warn(`[AISUBS] ${msg}`);
+          ctx.errors.push(msg);
+          if (res.status === 429 || res.status >= 500) {
+            if (/per ?day/i.test(body) || attempt === 3) return texts.map(() => null);   // daily quota / still limited
+            await sleep(retryDelayMs(res, body, attempt));
+            again = true;                                                                  // retry same model
+          }
+          continue;                                                                        // else: next model
+        }
 
-      const data = await res.json();
-      const parts = data.candidates?.[0]?.content?.parts || [];
-      const reply = parts.filter(p => p.text && !p.thought).map(p => p.text).join('');
-      if (!reply.trim()) {
-        const why = data.promptFeedback?.blockReason || data.candidates?.[0]?.finishReason || 'empty reply';
-        ctx.errors.push(`Gemini ${m}: ${why}`);
-        continue;
+        const data = await res.json();
+        const parts = data.candidates?.[0]?.content?.parts || [];
+        const reply = parts.filter(p => p.text && !p.thought).map(p => p.text).join('');
+        if (!reply.trim()) {
+          ctx.errors.push(`Gemini ${m}: ${data.promptFeedback?.blockReason || data.candidates?.[0]?.finishReason || 'empty reply'}`);
+          continue;
+        }
+        return parseNumberedReply(reply, texts);
+      } catch (e) {
+        console.warn(`[AISUBS] Gemini ${m} error:`, e.message);
+        ctx.errors.push(`Gemini ${m}: ${e.message}`);
+        again = attempt < 1;                                                               // one retry on network/timeout
       }
-      return parseNumberedReply(reply, texts);
-    } catch (e) {
-      console.warn(`[AISUBS] Gemini ${m} error:`, e.message);
-      ctx.errors.push(`Gemini ${m}: ${e.message}`);
     }
   }
-
   return translateWithFreeFallback(texts, targetLang, ctx);
 }
 
