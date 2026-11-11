@@ -847,11 +847,11 @@ async function generateVtt({ config, candidates, type, id, raw }) {
   if (raw !== 'true' && missed > cues.length * 0.2) {
     const reason = (ctx.errors[0] || 'unknown error').slice(0, 140);
     console.error(`[AISUBS] Translation failed for ${missed}/${cues.length} cues. First error: ${reason}`);
-    const banner = `[ ⚠ AISUBS: translation to ${targetName} failed - showing original. ${reason} ]`;
+    const banner = `[ AISUBS: translation to ${targetName} failed - showing original. ${reason} ]`;
     return { vtt: buildWebVTT(cues, banner), cacheable: false };   // don't cache a failure
   }
 
-  const banner = raw === 'true' ? '' : `[ 🤖 AISUBS: Translated to ${targetName} via ${providerName} ]`;
+  const banner = raw === 'true' ? '' : `[ AISUBS: Translated to ${targetName} via ${providerName} ]`;
   return { vtt: buildWebVTT(cues, banner), cacheable: true };
 }
 
@@ -1079,8 +1079,10 @@ function buildWebVTT(cues, bannerText) {
     cueIndex++;
   }
 
-  cues.forEach(cue => {
-    vtt += `${cueIndex}\n${cue.start} --> ${cue.end}\n${cue.text}\n\n`;
+  cues.forEach((cue, i) => {
+    // Also attach the notice to the first real line, so players that activate the track late still show it.
+    const text = (i === 0 && bannerText) ? `${bannerText}\n${cue.text}` : cue.text;
+    vtt += `${cueIndex}\n${cue.start} --> ${cue.end}\n${text}\n\n`;
     cueIndex++;
   });
 
