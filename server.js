@@ -1033,7 +1033,11 @@ function buildWebVTT(cues, bannerText) {
   let cueIndex = 1;
 
   if (bannerText) {
-    vtt += `${cueIndex}\n00:00:00.800 --> 00:00:05.500\n${bannerText}\n\n`;
+    // Some players (e.g. Nuvio) attach the external track a few seconds after playback starts, so a short
+    // 0.8-5.5s banner can be over before the track is live. Show it longer, and once more shortly after.
+    vtt += `${cueIndex}\n00:00:00.500 --> 00:00:10.000\n${bannerText}\n\n`;
+    cueIndex++;
+    vtt += `${cueIndex}\n00:00:30.000 --> 00:00:36.000\n${bannerText}\n\n`;
     cueIndex++;
   }
 
