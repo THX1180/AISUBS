@@ -14,6 +14,43 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 // Without this, every subtitle URL we hand to Stremio/Nuvio is http:// and gets blocked.
 app.set('trust proxy', true);
 
+// ---- Access control -------------------------------------------------------------------------------
+// Set ACCESS_TOKEN (letters+digits, 12+ chars) in Render. Every URL that can spend your AI quota must then be
+// prefixed with /k-<token>/ . The page, logo and the bare /manifest.json (used by your pinger) stay public: no secrets.
+const ACCESS_TOKEN = (process.env.ACCESS_TOKEN || '').trim();
+if (ACCESS_TOKEN && !/^[A-Za-z0-9]{12,}$/.test(ACCESS_TOKEN)) {
+  console.error('[AISUBS] ACCESS_TOKEN must be 12+ characters, letters and numbers only. Fix it in Render > Environment.');
+  process.exit(1);
+}
+const TOKEN_RE = /^\/k-([A-Za-z0-9]+)(?=\/|\?|$)/;
+const safeEqual = (a, b) => {
+  const x = Buffer.from(a), y = Buffer.from(b);
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+const hits = new Map();   // "ip:authed" -> { n, reset }
+setInterval(() => { const t = Date.now(); for (const [k, v] of hits) if (v.reset < t) hits.delete(k); }, 60000).unref();
+function overLimit(key, max) {
+  const t = Date.now();
+  const h = hits.get(key);
+  if (!h || h.reset < t) { hits.set(key, { n: 1, reset: t + 60000 }); return false; }
+  return ++h.n > max;
+}
+const PUBLIC_PATHS = new Set(['/', '/index.html', '/style.css', '/logo.png', '/health', '/manifest.json']);
+
+app.use((req, res, next) => {
+  let authed = !ACCESS_TOKEN;
+  const m = TOKEN_RE.exec(req.url);
+  if (m) {
+    if (ACCESS_TOKEN && safeEqual(m[1], ACCESS_TOKEN)) { authed = true; req.tokenPrefix = m[0]; }
+    req.url = req.url.slice(m[0].length) || '/';
+  }
+  const isPublic = PUBLIC_PATHS.has(req.path) || req.path.endsWith('/configure');
+  if (isPublic) return next();
+  if (overLimit(`${req.ip}:${authed}`, authed ? 120 : 15)) return res.status(429).json({ error: 'Too many requests' });
+  if (!authed) return res.status(404).json({ error: 'Not found' });   // 404, not 401: don't reveal the gate
+  next();
+});
+
 // Public base URL used inside subtitle URLs. Set PUBLIC_URL=https://your-host to pin it.
 function publicBase(req) {
   if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/+$/, '');
@@ -41,6 +78,7 @@ app.use(express.json({ limit: '10mb' }));
 // Serve ONLY the UI files. express.static('.') used to expose profiles.json (API keys) and server.js.
 app.get(['/', '/index.html', '/configure', '/:config/configure', '/p/:profile/configure'],
   (req, res) => res.sendFile(path.join(ROOT, 'index.html')));
+app.get('/health', (req, res) => res.send('ok'));
 app.get('/style.css', (req, res) => res.sendFile(path.join(ROOT, 'style.css')));
 app.get('/logo.png', (req, res) => res.sendFile(path.join(ROOT, 'logo.png')));
 
@@ -344,7 +382,7 @@ app.post('/api/profiles/save', (req, res) => {
   savedProfiles[slug] = config;
   persistProfiles();
 
-  res.json({ success: true, slug, url: `${req.protocol}://${req.get('host')}/p/${slug}/manifest.json` });
+  res.json({ success: true, slug, url: `${publicBase(req)}${req.tokenPrefix || ''}/p/${slug}/manifest.json` });
 });
 
 // ----------------------------------------------------
@@ -493,7 +531,7 @@ app.get(/\/subtitles\//, async (req, res) => {
   const rankedEn = candidateSubs.filter(s => L.isEnglish(s.lang)).sort((a, b) => b.score - a.score);
   const rankedTarget = candidateSubs.filter(s => L.isTarget(s.lang)).sort((a, b) => b.score - a.score);
 
-  const base = publicBase(req);
+  const base = publicBase(req) + (req.tokenPrefix || '');
   const cfg = encodeURIComponent(profileOrConfig);   // pass through what the user installed; no re-encoding of secrets
   const targetName = config.langName || 'Dutch';
   const out = [];

@@ -281,6 +281,9 @@
     const subdlApiKey = document.getElementById('subdlApiKey');
     const subsourceApiKey = document.getElementById('subsourceApiKey');
 
+    // Token prefix (/k-TOKEN) taken from the page address, so API calls and install links carry it.
+    const TOKEN_PREFIX = (location.pathname.match(/^\/k-[A-Za-z0-9]+/) || [''])[0];
+
     // ---- Model dropdown -------------------------------------------------
     // modelInput (hidden unless "Custom") remains the value every other function reads/saves.
     const modelSelect = document.getElementById('modelSelect');
@@ -526,7 +529,7 @@
       badgeEl.textContent = '⏳';
 
       try {
-        const res = await fetch(url, {
+        const res = await fetch(TOKEN_PREFIX + url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
@@ -619,7 +622,7 @@
         .replace(/\+/g, '-')
         .replace(/\//g, '_')
         .replace(/=+$/, '');
-      return `${window.location.origin}/${b64}/manifest.json`;
+      return `${window.location.origin}${TOKEN_PREFIX}/${b64}/manifest.json`;
     }
 
     function showToast(msg) {
@@ -650,7 +653,7 @@
       const config = getActiveConfigObj();
 
       try {
-        const res = await fetch('/api/profiles/save', {
+        const res = await fetch(TOKEN_PREFIX + '/api/profiles/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ name: activeName, config })
