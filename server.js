@@ -450,6 +450,8 @@ async function fromOpenSubsApi(config, imdbId, season, episode, videoHash, filen
     params.set('imdb_id', imdbId.replace(/^tt/, ''));
   }
   if (videoHash) params.set('moviehash', videoHash);
+  params.set('machine_translated', 'include');   // by default these are left out of results
+  params.set('ai_translated', 'include');
 
   const r = await fetch(`https://api.opensubtitles.com/api/v1/subtitles?${params}`, {
     headers: { 'Api-Key': config.osApiKey, 'User-Agent': 'AISUBS v2.5.0', Accept: 'application/json' },
@@ -462,10 +464,11 @@ async function fromOpenSubsApi(config, imdbId, season, episode, videoHash, filen
     if (!fileId) return [];
     const release = item.attributes?.release || filename || 'Release';
     const isHashMatch = item.attributes?.moviehash_match === true;
+    const machineKind = item.attributes?.ai_translated ? 'ai' : (item.attributes?.machine_translated ? 'machine' : null);
     return [{
       source: 'OpenSubtitles', release, isHashMatch, isEmbedded: false,
       score: scoreSubtitleMatch(release, filename || '', isHashMatch),
-      lang: item.attributes?.language,
+      lang: item.attributes?.language, machine: !!machineKind, machineKind,
       // Opaque reference: the API key is resolved server-side, never put in a URL the client can see.
       url: `os://${fileId}`
     }];
@@ -489,6 +492,31 @@ async function fromSubDL(config, imdbId, season, episode, filename, L) {
       url: s.url.startsWith('http') ? s.url : `https://dl.subdl.com${s.url}`
     };
   });
+}
+
+const shortName = (t) => (t || '').length > 70 ? `${t.slice(0, 67)}…` : (t || '');
+// ✅ = made for your exact file (hash match). 🟡 = release name matches your file. ⚠️ = no match info (timing unverified).
+const matchMarker = (c) => c.isHashMatch ? '✅' : (c.score >= 200 ? '🟡' : '⚠️');
+
+function buildSubtitleTracks({ rankedEn, rankedTarget, targetName, iso3, mkUrl }) {
+  const tracks = [];
+  const used = new Set();
+  const add = (id, url) => {
+    let uid = id, n = 2;
+    while (used.has(uid)) uid = `${id} #${n++}`;
+    used.add(uid);
+    tracks.push({ id: uid, url, lang: iso3, label: uid });
+  };
+  // Up to 4 English sources, each its own "translate this one" choice (the best also gets the runner-up as backup).
+  rankedEn.slice(0, 4).forEach((c, i) => {
+    add(`${matchMarker(c)} AI → ${targetName} · ${c.source} · ${shortName(c.release)}`, mkUrl(c, i === 0 ? rankedEn[1] : null, false));
+  });
+  // Up to 4 ready-made subtitles in your language: instant, no AI cost.
+  rankedTarget.slice(0, 4).forEach(c => {
+    const kind = c.machineKind === 'ai' ? 'AI translation' : (c.machine ? 'Machine translation' : 'Native');
+    add(`${matchMarker(c)} ${kind} · ${c.source} · ${shortName(c.release)}`, mkUrl(c, null, true));
+  });
+  return tracks;
 }
 
 app.get(/\/subtitles\//, async (req, res) => {
@@ -528,47 +556,23 @@ app.get(/\/subtitles\//, async (req, res) => {
   settled.forEach(s => s.status === 'rejected' && console.warn('[AISUBS] provider error:', s.reason?.message));
   const candidateSubs = settled.flatMap(s => (s.status === 'fulfilled' ? s.value : []));
 
-  const rankedEn = candidateSubs.filter(s => L.isEnglish(s.lang)).sort((a, b) => b.score - a.score);
-  const rankedTarget = candidateSubs.filter(s => L.isTarget(s.lang)).sort((a, b) => b.score - a.score);
+  // Exact-file matches first, then human-made before machine-made, then release-name score.
+  const byQuality = (x, y) =>
+    (Number(!!y.isHashMatch) - Number(!!x.isHashMatch)) ||
+    (Number(!!x.machine) - Number(!!y.machine)) ||
+    (y.score - x.score);
+  const rankedEn = candidateSubs.filter(c => L.isEnglish(c.lang)).sort(byQuality);
+  const rankedTarget = candidateSubs.filter(c => L.isTarget(c.lang)).sort(byQuality);
 
   const base = publicBase(req) + (req.tokenPrefix || '');
   const cfg = encodeURIComponent(profileOrConfig);   // pass through what the user installed; no re-encoding of secrets
-  const targetName = config.langName || 'Dutch';
-  const out = [];
+  const mkUrl = (c, alt, raw) =>
+    `${base}/sub.vtt?cfg=${cfg}&type=${mediaType}&id=${encodeURIComponent(fullId)}&src=${encodeSourceParam(c.url)}` +
+    `${alt ? `&alt=${encodeSourceParam(alt.url)}` : ''}${raw ? '&raw=true' : ''}`;
 
-  if (rankedEn.length > 0) {
-    const best = rankedEn[0];
-    const alt = rankedEn[1] || null;
-    const tag = (best.score >= 200 || best.isHashMatch)
-      ? `✓ Synced [Release Match → ${targetName}]`
-      : `⏳ Auto-Sync [AI ${targetName}]`;
-
-    out.push({
-      id: 'aisubs-ai-top',
-      url: `${base}/sub.vtt?cfg=${cfg}&type=${mediaType}&id=${encodeURIComponent(fullId)}` +
-           `&src=${encodeSourceParam(best.url)}${alt ? `&alt=${encodeSourceParam(alt.url)}` : ''}`,
-      lang: L.iso3,
-      label: `${tag} · ${best.release}`
-    });
-    if (alt) {
-      out.push({
-        id: 'aisubs-ai-alt',
-        url: `${base}/sub.vtt?cfg=${cfg}&type=${mediaType}&id=${encodeURIComponent(fullId)}&src=${encodeSourceParam(alt.url)}`,
-        lang: L.iso3,
-        label: `⏳ Alternate [AI ${targetName}] · ${alt.source}`
-      });
-    }
-  }
-
-  if (rankedTarget.length > 0) {
-    const top = rankedTarget[0];
-    out.push({
-      id: 'aisubs-native-0',
-      url: `${base}/sub.vtt?cfg=${cfg}&type=${mediaType}&id=${encodeURIComponent(fullId)}&src=${encodeSourceParam(top.url)}&raw=true`,
-      lang: L.iso3,
-      label: `✓ Native · ${top.source} · ${top.release}`
-    });
-  }
+  const out = buildSubtitleTracks({
+    rankedEn, rankedTarget, targetName: config.langName || 'Dutch', iso3: L.iso3, mkUrl
+  });
 
   return res.json({ subtitles: out });
 });
