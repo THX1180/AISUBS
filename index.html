@@ -215,6 +215,17 @@
               <span class="helper">Original + Translated</span>
             </div>
           </div>
+
+          <div class="form-group checkbox-group">
+            <label class="custom-switch">
+              <input type="checkbox" id="prewarm" checked>
+              <span class="slider"></span>
+            </label>
+            <div class="switch-meta">
+              <span class="switch-title">Pre-translate</span>
+              <span class="helper">Starts translating when you open a title, so it's ready sooner. Uses AI credit even if you don't pick the track. Skipped when a native subtitle exists.</span>
+            </div>
+          </div>
         </div>
 
         <!-- Actions -->
@@ -274,6 +285,7 @@
     const modelInput = document.getElementById('modelInput');
     const offsetMs = document.getElementById('offsetMs');
     const bilingual = document.getElementById('bilingual');
+    const prewarmToggle = document.getElementById('prewarm');
     const torboxApiKey = document.getElementById('torboxApiKey');
     const osApiKey = document.getElementById('osApiKey');
     const osUsername = document.getElementById('osUsername');
@@ -360,6 +372,7 @@
         model: 'gemini-3.6-flash',
         offsetMs: 0,
         bilingual: false,
+        prewarm: true,
         torboxApiKey: '',
         osApiKey: '',
         osUsername: '',
@@ -393,6 +406,7 @@
       renderModelOptions();
       offsetMs.value = p.offsetMs || 0;
       bilingual.checked = !!p.bilingual;
+      prewarmToggle.checked = p.prewarm !== false;
       torboxApiKey.value = p.torboxApiKey || '';
       osApiKey.value = p.osApiKey || '';
       osUsername.value = p.osUsername || '';
@@ -414,6 +428,7 @@
         model: modelInput.value.trim(),
         offsetMs: parseInt(offsetMs.value, 10) || 0,
         bilingual: bilingual.checked,
+        prewarm: prewarmToggle.checked,
         torboxApiKey: torboxApiKey.value.trim(),
         osApiKey: osApiKey.value.trim(),
         osUsername: osUsername.value.trim(),
@@ -440,6 +455,7 @@
         model: modelInput.value.trim(),
         offsetMs: 0,
         bilingual: false,
+        prewarm: true,
         torboxApiKey: '',
         osApiKey: '',
         osUsername: '',
@@ -606,6 +622,7 @@
         model: modelInput.value.trim() || 'default',
         offsetMs: parseInt(offsetMs.value, 10) || 0,
         bilingual: bilingual.checked,
+        prewarm: prewarmToggle.checked,
         torboxApiKey: torboxApiKey.value.trim(),
         osApiKey: osApiKey.value.trim(),
         osUsername: osUsername.value.trim(),
