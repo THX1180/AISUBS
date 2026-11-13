@@ -185,7 +185,7 @@ function decodeSourceParam(param) {
   if (!param) return '';
   try {
     const decoded = Buffer.from(param, 'base64url').toString('utf-8');
-    if (decoded.startsWith('http') || decoded.startsWith('os://')) return decoded;
+    if (decoded.startsWith('http') || decoded.startsWith('os://') || decoded.startsWith('subsource://')) return decoded;
   } catch {}
   return param;
 }
@@ -433,8 +433,9 @@ async function fromStremioOpenSubs(mediaType, fullId, extraStr, filename, videoH
       const release = filename || s.id || 'Video';
       return {
         source: 'OpenSubtitles-v3', release, isHashMatch: false, isEmbedded: false,
-        // The v3 proxy already ranks by hash/size when videoHash is sent, so its order is meaningful.
-        score: scoreSubtitleMatch(release, filename || '', false),
+        // The v3 proxy doesn't tell us anything about each subtitle, so no match score (shows as unverified);
+        // its own ordering is kept because the sort below is stable.
+        score: 0,
         lang: s.lang, url: s.url
       };
     });
@@ -494,27 +495,81 @@ async function fromSubDL(config, imdbId, season, episode, filename, L) {
   });
 }
 
-const shortName = (t) => (t || '').length > 70 ? `${t.slice(0, 67)}…` : (t || '');
+// ---- SubSource (needs the SubSource API key from the page) ----------------------------------------
+// Flow (as used by Bazarr): find the title id by IMDb id, then list subtitles per language (lowercase English
+// language name), then download /subtitles/<id>/download (a zip). Response field names are read defensively.
+const SUBSOURCE_BASE = 'https://api.subsource.net/api/v1';
+const listFrom = (j) => Array.isArray(j) ? j : (j?.data || j?.subtitles || j?.results || j?.movies || []);
+
+async function fromSubSource(config, imdbId, season, episode, filename, L) {
+  const headers = { 'X-API-Key': config.subsourceApiKey.trim(), 'User-Agent': 'AISUBS/2.6', Accept: 'application/json' };
+
+  const sr = await fetch(`${SUBSOURCE_BASE}/movies/search?searchType=imdb&q=${encodeURIComponent(imdbId)}`,
+    { headers, signal: AbortSignal.timeout(4500) });
+  if (!sr.ok) { console.warn(`[AISUBS] SubSource title search HTTP ${sr.status}`); return []; }
+  const sj = await sr.json();
+  const title = listFrom(sj)[0];
+  const movieId = title?.movieId ?? title?.id;
+  if (!movieId) { console.warn('[AISUBS] SubSource: no title id found. Response keys:', Object.keys(sj || {}).join(',')); return []; }
+
+  const epRe = (season && episode)
+    ? new RegExp(`s0*${Number(season)}[ ._-]?e0*${Number(episode)}\\b|\\b${Number(season)}x0*${Number(episode)}\\b`, 'i')
+    : null;
+  const langs = [
+    { name: 'english', lang: 'en' },
+    { name: (config.langName || 'Dutch').toLowerCase(), lang: L.iso1 }
+  ];
+
+  const perLang = await Promise.all(langs.map(async ({ name, lang }) => {
+    try {
+      const r = await fetch(`${SUBSOURCE_BASE}/subtitles?movieId=${encodeURIComponent(movieId)}&language=${encodeURIComponent(name)}`,
+        { headers, signal: AbortSignal.timeout(4500) });
+      if (!r.ok) { console.warn(`[AISUBS] SubSource list (${name}) HTTP ${r.status}`); return []; }
+      const items = listFrom(await r.json());
+      if (items.length && !(items[0].subtitleId ?? items[0].id)) {
+        console.warn('[AISUBS] SubSource: unexpected item shape, keys:', Object.keys(items[0]).join(','));
+      }
+      return items.flatMap(it => {
+        const id = it.subtitleId ?? it.id;
+        const release = it.releaseInfo ?? it.release_info ?? it.release ?? it.name ?? '';
+        if (!id) return [];
+        if (epRe && !epRe.test(String(release))) return [];     // series: only this episode
+        return [{
+          source: 'SubSource', release: String(release) || filename || 'Release',
+          isHashMatch: false, isEmbedded: false,
+          score: scoreSubtitleMatch(String(release), filename || '', false),
+          lang, url: `subsource://${id}`
+        }];
+      }).slice(0, 8);
+    } catch (e) {
+      console.warn(`[AISUBS] SubSource list (${name}) error:`, e.message);
+      return [];
+    }
+  }));
+  return perLang.flat();
+}
+
 // ✅ = made for your exact file (hash match). 🟡 = release name matches your file. ⚠️ = no match info (timing unverified).
 const matchMarker = (c) => c.isHashMatch ? '✅' : (c.score >= 200 ? '🟡' : '⚠️');
 
 function buildSubtitleTracks({ rankedEn, rankedTarget, targetName, iso3, mkUrl }) {
   const tracks = [];
   const used = new Set();
-  const add = (id, url) => {
-    let uid = id, n = 2;
-    while (used.has(uid)) uid = `${id} #${n++}`;
+  const add = (id, source, url) => {
+    let uid = id;
+    if (used.has(uid)) uid = `${id} (${source})`;
+    for (let n = 2; used.has(uid); n++) uid = `${id} (${source}) #${n}`;
     used.add(uid);
     tracks.push({ id: uid, url, lang: iso3, label: uid });
   };
   // Up to 4 English sources, each its own "translate this one" choice (the best also gets the runner-up as backup).
   rankedEn.slice(0, 4).forEach((c, i) => {
-    add(`${matchMarker(c)} AI → ${targetName} · ${c.source} · ${shortName(c.release)}`, mkUrl(c, i === 0 ? rankedEn[1] : null, false));
+    add(`${matchMarker(c)} AI translation from English · ${c.release}`, c.source, mkUrl(c, i === 0 ? rankedEn[1] : null, false));
   });
   // Up to 4 ready-made subtitles in your language: instant, no AI cost.
   rankedTarget.slice(0, 4).forEach(c => {
-    const kind = c.machineKind === 'ai' ? 'AI translation' : (c.machine ? 'Machine translation' : 'Native');
-    add(`${matchMarker(c)} ${kind} · ${c.source} · ${shortName(c.release)}`, mkUrl(c, null, true));
+    const kind = c.machineKind === 'ai' ? 'AI translation' : (c.machine ? 'Machine translation' : `${targetName} (native)`);
+    add(`${matchMarker(c)} ${kind} · ${c.release}`, c.source, mkUrl(c, null, true));
   });
   return tracks;
 }
@@ -551,10 +606,12 @@ app.get(/\/subtitles\//, async (req, res) => {
   const jobs = [fromStremioOpenSubs(mediaType, fullId, extraStr, filename, videoHash, L)];
   if (config.osApiKey)    jobs.push(fromOpenSubsApi(config, imdbId, season, episode, videoHash, filename, L));
   if (config.subdlApiKey) jobs.push(fromSubDL(config, imdbId, season, episode, filename, L));
+  if (config.subsourceApiKey) jobs.push(fromSubSource(config, imdbId, season, episode, filename, L));
 
   const settled = await Promise.allSettled(jobs);
   settled.forEach(s => s.status === 'rejected' && console.warn('[AISUBS] provider error:', s.reason?.message));
   const candidateSubs = settled.flatMap(s => (s.status === 'fulfilled' ? s.value : []));
+  console.log('[AISUBS] candidates by source:', JSON.stringify(candidateSubs.reduce((m, c) => (m[c.source] = (m[c.source] || 0) + 1, m), {})));
 
   // Exact-file matches first, then human-made before machine-made, then release-name score.
   const byQuality = (x, y) =>
@@ -613,10 +670,17 @@ async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId, c
       }
     }
 
+    let reqHeaders = { 'User-Agent': 'Stremio/4.4.168', 'Accept': '*/*' };
+    if (targetUrl.startsWith('subsource://')) {
+      if (!config.subsourceApiKey) continue;
+      targetUrl = `${SUBSOURCE_BASE}/subtitles/${targetUrl.slice(12)}/download`;
+      reqHeaders = { ...reqHeaders, 'X-API-Key': config.subsourceApiKey.trim() };
+    }
+
     try {
       console.log(`[AISUBS] Downloading candidate: ${targetUrl.slice(0, 70)}...`);
       const res = await fetch(targetUrl, {
-        headers: { 'User-Agent': 'Stremio/4.4.168', 'Accept': '*/*' },
+        headers: reqHeaders,
         redirect: 'follow',
         signal: AbortSignal.timeout(8000)
       });
