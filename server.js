@@ -146,7 +146,6 @@ function parseConfig(raw) {
     model: GEMINI_DEFAULT_MODEL,
     offsetMs: 0,
     bilingual: false,
-    prewarm: false,   // start translating when the subtitle list is requested (UI switch turns it on)
     torboxApiKey: '',
     osApiKey: '',
     osUsername: '',
@@ -502,52 +501,16 @@ async function fromSubDL(config, imdbId, season, episode, filename, L) {
 const SUBSOURCE_BASE = 'https://api.subsource.net/api/v1';
 const listFrom = (j) => Array.isArray(j) ? j : (j?.data || j?.subtitles || j?.results || j?.movies || []);
 
-// Finds SubSource's own title id. Tries the IMDb search first; on rejection, falls back to a title-text search
-// (title looked up from Stremio's public Cinemeta). Every rejection is logged with the server's reply.
-async function subsourceFindTitle(headers, imdbId, season) {
-  const search = async (qs) => {
-    try {
-      const r = await fetch(`${SUBSOURCE_BASE}/movies/search?${qs}`, { headers, signal: AbortSignal.timeout(4000) });
-      if (!r.ok) {
-        const body = (await r.text()).replace(/\s+/g, ' ').slice(0, 200);
-        console.warn(`[AISUBS] SubSource title search (${qs.slice(0, 45)}) HTTP ${r.status}: ${body}`);
-        return [];
-      }
-      return listFrom(await r.json());
-    } catch (e) {
-      console.warn('[AISUBS] SubSource title search error:', e.message);
-      return [];
-    }
-  };
-
-  let items = await search(`searchType=imdb&q=${encodeURIComponent(imdbId)}`);
-  if (!items.length) items = await search(`searchType=imdb&q=${encodeURIComponent(imdbId.replace(/^tt/, ''))}`);
-  if (!items.length) {
-    try {
-      const kind = season ? 'series' : 'movie';
-      const cm = await fetch(`https://v3-cinemeta.strem.io/meta/${kind}/${imdbId}.json`, { signal: AbortSignal.timeout(3000) });
-      const name = cm.ok ? (await cm.json())?.meta?.name : null;
-      if (name) items = await search(`searchType=text&q=${encodeURIComponent(name)}`);
-    } catch (e) {
-      console.warn('[AISUBS] Cinemeta title lookup failed:', e.message);
-    }
-  }
-  if (!items.length) return null;
-
-  const imdbOf = (i) => String(i.imdbId ?? i.imdb_id ?? i.imdb ?? '');
-  const pick = items.find(i => imdbOf(i) === imdbId)
-    || (season && items.find(i => Number(i.season) === Number(season)))
-    || items[0];
-  const id = pick?.movieId ?? pick?.id;
-  console.log(`[AISUBS] SubSource title: id=${id} | fields: ${Object.keys(pick || {}).slice(0, 14).join(',')}`);
-  return id || null;
-}
-
 async function fromSubSource(config, imdbId, season, episode, filename, L) {
   const headers = { 'X-API-Key': config.subsourceApiKey.trim(), 'User-Agent': 'AISUBS/2.6', Accept: 'application/json' };
 
-  const movieId = await subsourceFindTitle(headers, imdbId, season);
-  if (!movieId) return [];
+  const sr = await fetch(`${SUBSOURCE_BASE}/movies/search?searchType=imdb&q=${encodeURIComponent(imdbId)}`,
+    { headers, signal: AbortSignal.timeout(4500) });
+  if (!sr.ok) { console.warn(`[AISUBS] SubSource title search HTTP ${sr.status}`); return []; }
+  const sj = await sr.json();
+  const title = listFrom(sj)[0];
+  const movieId = title?.movieId ?? title?.id;
+  if (!movieId) { console.warn('[AISUBS] SubSource: no title id found. Response keys:', Object.keys(sj || {}).join(',')); return []; }
 
   const epRe = (season && episode)
     ? new RegExp(`s0*${Number(season)}[ ._-]?e0*${Number(episode)}\\b|\\b${Number(season)}x0*${Number(episode)}\\b`, 'i')
@@ -643,10 +606,7 @@ app.get(/\/subtitles\//, async (req, res) => {
   const jobs = [fromStremioOpenSubs(mediaType, fullId, extraStr, filename, videoHash, L)];
   if (config.osApiKey)    jobs.push(fromOpenSubsApi(config, imdbId, season, episode, videoHash, filename, L));
   if (config.subdlApiKey) jobs.push(fromSubDL(config, imdbId, season, episode, filename, L));
-  if (config.subsourceApiKey) {
-    // Hard 6s cap so a slow SubSource can never delay the whole subtitle list.
-    jobs.push(Promise.race([fromSubSource(config, imdbId, season, episode, filename, L), sleep(6000).then(() => [])]));
-  }
+  if (config.subsourceApiKey) jobs.push(fromSubSource(config, imdbId, season, episode, filename, L));
 
   const settled = await Promise.allSettled(jobs);
   settled.forEach(s => s.status === 'rejected' && console.warn('[AISUBS] provider error:', s.reason?.message));
@@ -670,16 +630,6 @@ app.get(/\/subtitles\//, async (req, res) => {
   const out = buildSubtitleTracks({
     rankedEn, rankedTarget, targetName: config.langName || 'Dutch', iso3: L.iso3, mkUrl
   });
-
-  // Pre-translation: start the top AI track in the background so it is ready when the player asks for it.
-  // Skipped when a native subtitle in your language exists (nothing to translate) or no AI key is set.
-  if (config.prewarm && rankedEn.length > 0 && rankedTarget.length === 0 &&
-      (config.apiKey || ENV_GEMINI_KEY) && config.provider !== 'free' && inflight.size < MAX_PREWARM_INFLIGHT) {
-    const candidates = [rankedEn[0].url, rankedEn[1]?.url].filter(Boolean);
-    console.log(`[AISUBS] Pre-translating in background: ${fullId}`);
-    getOrBuildVtt({ config, candidates, type: mediaType, id: fullId, raw: undefined })
-      .catch(e => console.warn('[AISUBS] Pre-translate failed:', e.message));
-  }
 
   return res.json({ subtitles: out });
 });
@@ -973,42 +923,30 @@ async function generateVtt({ config, candidates, type, id, raw }) {
   return { vtt: buildWebVTT(cues, banner), cacheable: true };
 }
 
-const MAX_PREWARM_INFLIGHT = 2;   // never run more than this many background translations at once
-
-// Same key for pre-translation and for the player's own request, so a pre-translated track is never paid for twice.
-function vttCacheKey(config, candidates, id, raw) {
-  return `${candidates[0] || id}_${config.lang}_${config.provider}_${config.model}_${config.offsetMs}_${config.bilingual}_${raw === 'true' ? 'raw' : 'ai'}`;
-}
-
-async function getOrBuildVtt({ config, candidates, type, id, raw }) {
-  const key = vttCacheKey(config, candidates, id, raw);
-  if (subCache.has(key)) return { vtt: subCache.get(key) };
-  const recentFail = failCache.get(key);
-  if (recentFail && recentFail.until > Date.now()) return { vtt: recentFail.vtt };
-
-  let job = inflight.get(key);
-  if (!job) {
-    job = generateVtt({ config, candidates, type, id, raw }).then(({ vtt, cacheable }) => {
-      if (cacheable) setInCache(key, vtt);
-      else failCache.set(key, { vtt, until: Date.now() + 120000 });   // retry allowed after 2 min
-      return { vtt };
-    });
-    inflight.set(key, job);
-    job.catch(() => {}).finally(() => inflight.delete(key));
-  }
-  return job;
-}
-
 app.get('/sub.vtt', async (req, res) => {
   const { cfg, src, alt, type, id, raw } = req.query;
   const config = parseConfig(cfg);
-  const candidates = [decodeSourceParam(src), decodeSourceParam(alt)].filter(Boolean);
+  const primaryUrl = decodeSourceParam(src);
+  const candidates = [primaryUrl, decodeSourceParam(alt)].filter(Boolean);
 
   res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
   res.setHeader('Access-Control-Allow-Origin', '*');
 
+  const cacheKey = `${primaryUrl || id}_${config.lang}_${config.provider}_${config.offsetMs}_${config.bilingual}_${raw}`;
+  if (subCache.has(cacheKey)) return res.send(subCache.get(cacheKey));
+  const recentFail = failCache.get(cacheKey);
+  if (recentFail && recentFail.until > Date.now()) return res.send(recentFail.vtt);
+
   try {
-    const { vtt } = await getOrBuildVtt({ config, candidates, type, id, raw });
+    let job = inflight.get(cacheKey);
+    if (!job) {
+      job = generateVtt({ config, candidates, type, id, raw });
+      inflight.set(cacheKey, job);
+      job.finally(() => inflight.delete(cacheKey)).catch(() => {});
+    }
+    const { vtt, cacheable } = await job;
+    if (cacheable) setInCache(cacheKey, vtt);
+    else failCache.set(cacheKey, { vtt, until: Date.now() + 120000 });   // retry allowed after 2 min
     res.send(vtt);
   } catch (err) {
     console.error('[AISUBS] Stream error:', err.message);
