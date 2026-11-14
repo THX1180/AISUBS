@@ -501,16 +501,52 @@ async function fromSubDL(config, imdbId, season, episode, filename, L) {
 const SUBSOURCE_BASE = 'https://api.subsource.net/api/v1';
 const listFrom = (j) => Array.isArray(j) ? j : (j?.data || j?.subtitles || j?.results || j?.movies || []);
 
+// Finds SubSource's own title id. Tries the IMDb search first; on rejection, falls back to a title-text search
+// (title looked up from Stremio's public Cinemeta). Every rejection is logged with the server's reply.
+async function subsourceFindTitle(headers, imdbId, season) {
+  const search = async (qs) => {
+    try {
+      const r = await fetch(`${SUBSOURCE_BASE}/movies/search?${qs}`, { headers, signal: AbortSignal.timeout(4000) });
+      if (!r.ok) {
+        const body = (await r.text()).replace(/\s+/g, ' ').slice(0, 200);
+        console.warn(`[AISUBS] SubSource title search (${qs.slice(0, 45)}) HTTP ${r.status}: ${body}`);
+        return [];
+      }
+      return listFrom(await r.json());
+    } catch (e) {
+      console.warn('[AISUBS] SubSource title search error:', e.message);
+      return [];
+    }
+  };
+
+  let items = await search(`searchType=imdb&q=${encodeURIComponent(imdbId)}`);
+  if (!items.length) items = await search(`searchType=imdb&imdb=${encodeURIComponent(imdbId)}`);
+  if (!items.length) {
+    try {
+      const kind = season ? 'series' : 'movie';
+      const cm = await fetch(`https://v3-cinemeta.strem.io/meta/${kind}/${imdbId}.json`, { signal: AbortSignal.timeout(3000) });
+      const name = cm.ok ? (await cm.json())?.meta?.name : null;
+      if (name) items = await search(`searchType=text&q=${encodeURIComponent(name)}`);
+    } catch (e) {
+      console.warn('[AISUBS] Cinemeta title lookup failed:', e.message);
+    }
+  }
+  if (!items.length) return null;
+
+  const imdbOf = (i) => String(i.imdbId ?? i.imdb_id ?? i.imdb ?? '');
+  const pick = items.find(i => imdbOf(i) === imdbId)
+    || (season && items.find(i => Number(i.season) === Number(season)))
+    || items[0];
+  const id = pick?.movieId ?? pick?.id;
+  console.log(`[AISUBS] SubSource title: id=${id} | fields: ${Object.keys(pick || {}).slice(0, 14).join(',')}`);
+  return id || null;
+}
+
 async function fromSubSource(config, imdbId, season, episode, filename, L) {
   const headers = { 'X-API-Key': config.subsourceApiKey.trim(), 'User-Agent': 'AISUBS/2.6', Accept: 'application/json' };
 
-  const sr = await fetch(`${SUBSOURCE_BASE}/movies/search?searchType=imdb&q=${encodeURIComponent(imdbId)}`,
-    { headers, signal: AbortSignal.timeout(4500) });
-  if (!sr.ok) { console.warn(`[AISUBS] SubSource title search HTTP ${sr.status}`); return []; }
-  const sj = await sr.json();
-  const title = listFrom(sj)[0];
-  const movieId = title?.movieId ?? title?.id;
-  if (!movieId) { console.warn('[AISUBS] SubSource: no title id found. Response keys:', Object.keys(sj || {}).join(',')); return []; }
+  const movieId = await subsourceFindTitle(headers, imdbId, season);
+  if (!movieId) return [];
 
   const epRe = (season && episode)
     ? new RegExp(`s0*${Number(season)}[ ._-]?e0*${Number(episode)}\\b|\\b${Number(season)}x0*${Number(episode)}\\b`, 'i')
@@ -550,7 +586,8 @@ async function fromSubSource(config, imdbId, season, episode, filename, L) {
 }
 
 // ✅ = made for your exact file (hash match). 🟡 = release name matches your file. ⚠️ = no match info (timing unverified).
-const matchMarker = (c) => c.isHashMatch ? '✅' : (c.score >= 200 ? '🟡' : '⚠️');
+const matchMarker = (c) => (c.isHashMatch || c.sync?.state === 'verified' || c.sync?.state === 'corrected')
+  ? '✅' : (c.score >= 200 ? '🟡' : '⚠️');
 
 function buildSubtitleTracks({ rankedEn, rankedTarget, targetName, iso3, mkUrl }) {
   const tracks = [];
@@ -564,7 +601,7 @@ function buildSubtitleTracks({ rankedEn, rankedTarget, targetName, iso3, mkUrl }
   };
   // Up to 4 English sources, each its own "translate this one" choice (the best also gets the runner-up as backup).
   rankedEn.slice(0, 4).forEach((c, i) => {
-    add(`${matchMarker(c)} AI translation from English · ${c.release}`, c.source, mkUrl(c, i === 0 ? rankedEn[1] : null, false));
+    add(`${matchMarker(c)}${c.ready ? ' ⚡' : ''} AI translation from English · ${c.release}`, c.source, mkUrl(c, i === 0 ? rankedEn[1] : null, false));
   });
   // Up to 4 ready-made subtitles in your language: instant, no AI cost.
   rankedTarget.slice(0, 4).forEach(c => {
@@ -606,7 +643,10 @@ app.get(/\/subtitles\//, async (req, res) => {
   const jobs = [fromStremioOpenSubs(mediaType, fullId, extraStr, filename, videoHash, L)];
   if (config.osApiKey)    jobs.push(fromOpenSubsApi(config, imdbId, season, episode, videoHash, filename, L));
   if (config.subdlApiKey) jobs.push(fromSubDL(config, imdbId, season, episode, filename, L));
-  if (config.subsourceApiKey) jobs.push(fromSubSource(config, imdbId, season, episode, filename, L));
+  if (config.subsourceApiKey) {
+    // Hard 6s cap so a slow SubSource can never delay the whole subtitle list.
+    jobs.push(Promise.race([fromSubSource(config, imdbId, season, episode, filename, L), sleep(6000).then(() => [])]));
+  }
 
   const settled = await Promise.allSettled(jobs);
   settled.forEach(s => s.status === 'rejected' && console.warn('[AISUBS] provider error:', s.reason?.message));
@@ -618,6 +658,16 @@ app.get(/\/subtitles\//, async (req, res) => {
     (Number(!!y.isHashMatch) - Number(!!x.isHashMatch)) ||
     (Number(!!x.machine) - Number(!!y.machine)) ||
     (y.score - x.score);
+  // Remember what we know: sync results from earlier plays, and which translations are already saved (ready).
+  candidateSubs.forEach(c => {
+    c.sync = syncStatus.get(c.url) || null;
+    c.ready = subCache.has(vttCacheKey(config, [c.url], fullId, undefined));
+  });
+  // Reference for timing checks: the file made for your exact video, else a very close release match.
+  const refPool = candidateSubs.filter(c => !c.machine);
+  const refCand = refPool.filter(c => c.isHashMatch).sort(byQuality)[0]
+    || refPool.filter(c => c.score >= STRONG_RELEASE_SCORE).sort(byQuality)[0] || null;
+
   const rankedEn = candidateSubs.filter(c => L.isEnglish(c.lang)).sort(byQuality);
   const rankedTarget = candidateSubs.filter(c => L.isTarget(c.lang)).sort(byQuality);
 
@@ -625,7 +675,8 @@ app.get(/\/subtitles\//, async (req, res) => {
   const cfg = encodeURIComponent(profileOrConfig);   // pass through what the user installed; no re-encoding of secrets
   const mkUrl = (c, alt, raw) =>
     `${base}/sub.vtt?cfg=${cfg}&type=${mediaType}&id=${encodeURIComponent(fullId)}&src=${encodeSourceParam(c.url)}` +
-    `${alt ? `&alt=${encodeSourceParam(alt.url)}` : ''}${raw ? '&raw=true' : ''}`;
+    `${alt ? `&alt=${encodeSourceParam(alt.url)}` : ''}${raw ? '&raw=true' : ''}` +
+    `${refCand && refCand.url !== c.url ? `&ref=${encodeSourceParam(refCand.url)}` : ''}`;
 
   const out = buildSubtitleTracks({
     rankedEn, rankedTarget, targetName: config.langName || 'Dutch', iso3: L.iso3, mkUrl
@@ -878,13 +929,135 @@ function padAssTime(t) {
 // ----------------------------------------------------
 // Subtitle Stream & Translation Delivery (/sub.vtt)
 // ----------------------------------------------------
-async function generateVtt({ config, candidates, type, id, raw }) {
+// ---- Auto-sync against a reference subtitle ---------------------------------------------------------------
+// Compares WHEN people speak (not what they say), so it also works across languages. The reference is a subtitle
+// made for the exact file (hash match) or, failing that, a very close release-name match. Timing is only moved when
+// the evidence is clear; otherwise the subtitle is left exactly as it was.
+const STRONG_RELEASE_SCORE = 380;
+const SYNC_F1_MIN = 0.55;      // how well the speech timelines must overlap
+const SYNC_CONF_MIN = 0.12;    // ...and by how much that beats a random alignment
+const SYNC_RATIOS = [1, 1.001001, 0.999, 1.042709, 0.95904, 1.041667, 0.96];   // 23.976 / 24 / 25 fps mix-ups
+const syncStatus = new Map();  // candidate url -> { state: 'verified'|'corrected'|'unverified', lagSec, ratio, f1 }
+const refCache = new Map();    // reference url -> Float64Array of [start, end, ...] in seconds
+
+const tsToSec = (ts) => {
+  const [h, m, rest] = ts.split(':');
+  const [sec, ms = '0'] = rest.split('.');
+  return Number(h) * 3600 + Number(m) * 60 + Number(sec) + Number(ms.padEnd(3, '0').slice(0, 3)) / 1000;
+};
+const secToTs = (sec) => {
+  const t = Math.max(0, Math.round(sec * 1000));
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return `${p(Math.floor(t / 3600000))}:${p(Math.floor((t % 3600000) / 60000))}:${p(Math.floor((t % 60000) / 1000))}.${p(t % 1000, 3)}`;
+};
+const cuesToIntervals = (cues) => Float64Array.from(cues.flatMap(c => [tsToSec(c.start), tsToSec(c.end)]));
+const maxEnd = (iv) => { let m = 0; for (let k = 1; k < iv.length; k += 2) if (iv[k] > m) m = iv[k]; return m; };
+
+function speechBins(iv, scale, binSec, n) {
+  const b = new Uint8Array(n);
+  for (let k = 0; k < iv.length; k += 2) {
+    const from = Math.max(0, Math.floor(iv[k] * scale / binSec));
+    const to = Math.min(n, Math.ceil(iv[k + 1] * scale / binSec));
+    for (let i = from; i < to; i++) b[i] = 1;
+  }
+  return b;
+}
+
+// F1 overlap between reference bins R and candidate bins C shifted forward by `lag`, for lag in [lo, hi].
+function scanLags(R, C, lo, hi) {
+  let sumR = 0, sumC = 0;
+  for (let i = 0; i < R.length; i++) sumR += R[i];
+  for (let i = 0; i < C.length; i++) sumC += C[i];
+  const denom = (sumR + sumC) || 1;
+  let best = -1, bestLag = 0, total = 0, n = 0;
+  for (let lag = lo; lag <= hi; lag++) {
+    const from = Math.max(0, lag), to = Math.min(R.length, C.length + lag);
+    let ov = 0;
+    for (let i = from; i < to; i++) ov += R[i] & C[i - lag];
+    const f1 = (2 * ov) / denom;
+    total += f1; n++;
+    if (f1 > best) { best = f1; bestLag = lag; }
+  }
+  return { lag: bestLag, f1: best, baseline: total / n };
+}
+
+function findAlignment(refIv, candIv) {
+  const coarse = 0.5, maxLagSec = 180, span = Math.round(maxLagSec / coarse);
+  const endR = maxEnd(refIv), endC = maxEnd(candIv);
+  const attempt = (r) => {
+    const n = Math.ceil((Math.max(endR, endC * r) + maxLagSec + 5) / coarse);
+    const res = scanLags(speechBins(refIv, 1, coarse, n), speechBins(candIv, r, coarse, n), -span, span);
+    return { ratio: r, lagSec: res.lag * coarse, f1: res.f1, conf: res.f1 - res.baseline };
+  };
+  const clear = (x) => x.f1 >= SYNC_F1_MIN && x.conf >= SYNC_CONF_MIN;
+
+  let best = attempt(1);
+  if (!clear(best)) for (const r of SYNC_RATIOS.slice(1)) { const x = attempt(r); if (x.conf > best.conf) best = x; }
+  if (!clear(best)) return { state: 'unverified', ...best };
+
+  // Fine pass (0.1s) around the coarse answer.
+  const fine = 0.1;
+  const n = Math.ceil((Math.max(endR, endC * best.ratio) + maxLagSec + 5) / fine);
+  const centre = Math.round(best.lagSec / fine), w = Math.round(1.0 / fine);
+  const f = scanLags(speechBins(refIv, 1, fine, n), speechBins(candIv, best.ratio, fine, n), centre - w, centre + w);
+  return { state: 'ok', ratio: best.ratio, lagSec: Math.round(f.lag * fine * 10) / 10, f1: f.f1, conf: best.conf };
+}
+
+async function alignToReference({ cues, refUrl, candUrl, config, type, id }) {
+  try {
+    if (cues.length < 50) return { state: 'unverified' };
+    let refIv = refCache.get(refUrl);
+    if (!refIv) {
+      const { buffer } = await downloadSubtitleWithFallbacks([refUrl], type, id, config);
+      const refCues = parseSubtitleCues(decompressSubtitleBuffer(buffer));
+      if (!refCues || refCues.length < 50) throw new Error('reference subtitle too short');
+      refIv = cuesToIntervals(refCues);
+      if (refCache.size >= 30) refCache.delete(refCache.keys().next().value);
+      refCache.set(refUrl, refIv);
+    }
+    const a = findAlignment(refIv, cuesToIntervals(cues));
+    let state = 'unverified';
+    if (a.state === 'ok') {
+      const inSync = a.ratio === 1 && Math.abs(a.lagSec) <= 0.35;
+      state = inSync ? 'verified' : 'corrected';
+      if (!inSync) {
+        cues.forEach(c => {
+          c.start = secToTs(tsToSec(c.start) * a.ratio + a.lagSec);
+          c.end = secToTs(tsToSec(c.end) * a.ratio + a.lagSec);
+        });
+      }
+    }
+    const res = { state, lagSec: a.lagSec, ratio: a.ratio, f1: a.f1 };
+    syncStatus.set(candUrl, res);
+    return res;
+  } catch (e) {
+    console.warn('[AISUBS] Sync check skipped:', e.message);
+    return { state: 'unverified' };
+  }
+}
+
+// Long translated lines are split into two balanced lines so they read well on screen.
+function wrapSubtitleLine(t) {
+  if (t.includes('\n') || t.length <= 42) return t;
+  const mid = t.length / 2;
+  let best = -1, dist = Infinity;
+  for (let i = 0; i < t.length; i++) if (t[i] === ' ' && Math.abs(i - mid) < dist) { dist = Math.abs(i - mid); best = i; }
+  return best > 0 ? `${t.slice(0, best)}\n${t.slice(best + 1)}` : t;
+}
+
+async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
   const ctx = { errors: [] };
   let missed = 0;
   const { buffer } = await downloadSubtitleWithFallbacks(candidates, type, id, config);
   const cues = parseSubtitleCues(decompressSubtitleBuffer(buffer));
   if (!cues || cues.length === 0) throw new Error('No subtitle cues found after decompression');
   console.log(`[AISUBS] Parsed ${cues.length} cues.`);
+
+  if (refUrl && candidates[0] && refUrl !== candidates[0]) {
+    const st = await alignToReference({ cues, refUrl, candUrl: candidates[0], config, type, id });
+    console.log(`[AISUBS] Sync check: ${st.state}${st.state === 'corrected' ? ` (shift ${st.lagSec}s, speed x${st.ratio})` : ''}`);
+  }
+  const sourceTexts = cues.map(c => c.text);   // untouched originals, used as read-only context for translation
 
   if (config.offsetMs) {
     cues.forEach(c => {
@@ -900,11 +1073,13 @@ async function generateVtt({ config, candidates, type, id, raw }) {
 
     await mapPool(batches, TRANSLATE_CONCURRENCY, async (chunk, bi) => {
       console.log(`[AISUBS] Translating batch ${bi + 1}/${batches.length} (${chunk.length} lines)...`);
-      const translated = await translateBatch(chunk.map(c => c.text), config.langName || 'Dutch', config, ctx);
+      const context = bi === 0 ? [] : sourceTexts.slice(Math.max(0, bi * batchSize - 6), bi * batchSize);
+      const translated = await translateBatch(chunk.map(c => c.text), config.langName || 'Dutch', config, ctx, context);
       chunk.forEach((c, idx) => {
         const trans = translated[idx];
         if (trans == null) { missed++; return; }      // keep the original line, but remember it failed
-        c.text = config.bilingual ? `${c.text}\n<c.cyan>${trans}</c>` : trans;
+        const shown = wrapSubtitleLine(trans);
+        c.text = config.bilingual ? `${c.text}\n<c.cyan>${shown}</c>` : shown;
       });
     });
   }
@@ -923,16 +1098,21 @@ async function generateVtt({ config, candidates, type, id, raw }) {
   return { vtt: buildWebVTT(cues, banner), cacheable: true };
 }
 
+// One key function, so the menu can tell which translations are already saved (the ⚡ marker).
+function vttCacheKey(config, candidates, id, raw) {
+  return `${candidates[0] || id}_${config.lang}_${config.provider}_${config.model}_${config.offsetMs}_${config.bilingual}_${raw === 'true' ? 'raw' : 'ai'}`;
+}
+
 app.get('/sub.vtt', async (req, res) => {
-  const { cfg, src, alt, type, id, raw } = req.query;
+  const { cfg, src, alt, ref, type, id, raw } = req.query;
   const config = parseConfig(cfg);
-  const primaryUrl = decodeSourceParam(src);
-  const candidates = [primaryUrl, decodeSourceParam(alt)].filter(Boolean);
+  const candidates = [decodeSourceParam(src), decodeSourceParam(alt)].filter(Boolean);
+  const refUrl = decodeSourceParam(ref) || null;
 
   res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
   res.setHeader('Access-Control-Allow-Origin', '*');
 
-  const cacheKey = `${primaryUrl || id}_${config.lang}_${config.provider}_${config.offsetMs}_${config.bilingual}_${raw}`;
+  const cacheKey = vttCacheKey(config, candidates, id, raw);
   if (subCache.has(cacheKey)) return res.send(subCache.get(cacheKey));
   const recentFail = failCache.get(cacheKey);
   if (recentFail && recentFail.until > Date.now()) return res.send(recentFail.vtt);
@@ -940,7 +1120,7 @@ app.get('/sub.vtt', async (req, res) => {
   try {
     let job = inflight.get(cacheKey);
     if (!job) {
-      job = generateVtt({ config, candidates, type, id, raw });
+      job = generateVtt({ config, candidates, type, id, raw, refUrl });
       inflight.set(cacheKey, job);
       job.finally(() => inflight.delete(cacheKey)).catch(() => {});
     }
@@ -957,28 +1137,33 @@ app.get('/sub.vtt', async (req, res) => {
 // Translation Routing
 // Every function returns an array aligned with `texts`; an entry is null when that line could NOT be
 // translated. Callers must never silently substitute the original text (that is what hid the failures).
-async function translateBatch(texts, targetLang, config, ctx = { errors: [] }) {
+async function translateBatch(texts, targetLang, config, ctx = { errors: [] }, context = []) {
   const apiKey = (config.apiKey || ENV_GEMINI_KEY || '').trim();
   const provider = config.provider || 'gemini';
 
   if (provider === 'gemini' && apiKey) {
-    return translateWithGemini(texts, targetLang, apiKey, resolveGeminiModel(config.model), ctx);
+    return translateWithGemini(texts, targetLang, apiKey, resolveGeminiModel(config.model), ctx, context);
   }
   if (['openrouter', 'openai', 'groq', 'deepseek'].includes(provider) && apiKey) {
-    return translateWithOpenAICompatible(texts, targetLang, provider, apiKey, config.model, ctx);
+    return translateWithOpenAICompatible(texts, targetLang, provider, apiKey, config.model, ctx, context);
   }
 
   ctx.errors.push(apiKey ? `unknown provider "${provider}"` : 'no AI API key configured');
   return translateWithFreeFallback(texts, targetLang, ctx);
 }
 
-function buildPrompt(texts, targetLang) {
+function buildPrompt(texts, targetLang, context = []) {
+  const ctxBlock = context.length
+    ? `Context: the lines just before this batch (for reference only; do NOT translate or repeat them):\n${context.map(t => `- ${t.replace(/\n/g, ' ')}`).join('\n')}\n\n`
+    : '';
   return `You are a film and television subtitle translator.
 Translate the following numbered dialogue lines into ${targetLang}.
 Preserve line numbers and the '|' delimiter. Example format: '1| Translated line'.
+Rules: keep character names, place names and brand names exactly as written; give one output line per numbered line, but let sentences that continue across lines read naturally; keep sound descriptions in [brackets] and ♪ symbols; keep every line short enough to read on screen.
 Maintain the exact natural dialogue, timing brevity, and tone.
-Return ONLY the numbered list of translations, with NO intro, markdown fences, or outro:
+Return ONLY the numbered list of translations, with NO intro, markdown fences, or outro.
 
+${ctxBlock}Lines to translate:
 ${texts.map((t, idx) => `${idx + 1}| ${t.replace(/\n/g, ' ')}`).join('\n')}`;
 }
 
@@ -1002,9 +1187,9 @@ function retryDelayMs(res, body, attempt) {
 
 // Rate limits (429) and overloads (5xx) are retried on the SAME model with a wait. Falling through to other
 // models only happens when a model is unusable (404/400/403), never to dodge a rate limit.
-async function translateWithGemini(texts, targetLang, apiKey, model, ctx) {
+async function translateWithGemini(texts, targetLang, apiKey, model, ctx, context = []) {
   const modelsToTry = [...new Set([model, ...GEMINI_FALLBACK_MODELS])];
-  const prompt = buildPrompt(texts, targetLang);
+  const prompt = buildPrompt(texts, targetLang, context);
 
   for (const m of modelsToTry) {
     let again = true;
@@ -1051,7 +1236,7 @@ async function translateWithGemini(texts, targetLang, apiKey, model, ctx) {
   return translateWithFreeFallback(texts, targetLang, ctx);
 }
 
-async function translateWithOpenAICompatible(texts, targetLang, provider, apiKey, model, ctx) {
+async function translateWithOpenAICompatible(texts, targetLang, provider, apiKey, model, ctx, context = []) {
   let endpoint = 'https://api.openai.com/v1/chat/completions';
   let defaultModel = 'gpt-4o-mini';
 
@@ -1068,7 +1253,7 @@ async function translateWithOpenAICompatible(texts, targetLang, provider, apiKey
 
   // The UI/old profiles may still send a retired Gemini id as the model; don't forward it to other providers.
   const chosenModel = model && model !== 'default' && !RETIRED_GEMINI.test(model) ? model : defaultModel;
-  const prompt = buildPrompt(texts, targetLang);
+  const prompt = buildPrompt(texts, targetLang, context);
 
   try {
     const res = await fetch(endpoint, {
