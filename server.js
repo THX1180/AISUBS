@@ -551,9 +551,7 @@ async function fromSubSource(config, imdbId, season, episode, filename, L) {
   const movieId = await subsourceFindTitle(headers, imdbId, season);
   if (!movieId) return [];
 
-  const epRe = (season && episode)
-    ? new RegExp(`s0*${Number(season)}[ ._-]?e0*${Number(episode)}\\b|\\b${Number(season)}x0*${Number(episode)}\\b`, 'i')
-    : null;
+  const epRe = (season && episode) ? episodeRegex(season, episode) : null;
   const langs = [
     { name: 'english', lang: 'en' },
     { name: (config.langName || 'Dutch').toLowerCase(), lang: L.iso1 }
@@ -575,17 +573,23 @@ async function fromSubSource(config, imdbId, season, episode, filename, L) {
         if (!id) return [];
         // Commentary tracks and "foreign parts only" (forced) subtitles are not full dialogue.
         if (it.commentary || it.foreignParts) return [];
-        if (epRe && !epRe.test(release)) return [];     // series: only this episode
+        // Series: exact episode names are best. Names with NO episode marker are usually season packs (the right
+        // episode is picked from inside the zip). Names that point to a different episode are dropped.
+        const exact = !epRe || epRe.test(release);
+        const packLike = !!epRe && !exact && !EPISODE_MARK_RE.test(release);
+        if (epRe && !exact && !packLike) return [];
+        const pack = packLike && Number(it.files) > 1;
         const hi = !!it.hearingImpaired;
         return [{
-          source: 'SubSource', release: `${release || filename || 'Release'}${hi ? ' [HI]' : ''}`,
+          source: 'SubSource', release: `${release || filename || 'Release'}${pack ? ' [season pack]' : ''}${hi ? ' [HI]' : ''}`,
           isHashMatch: false, isEmbedded: false,
           // Hearing-impaired versions (sound descriptions) rank below plain dialogue subtitles.
-          score: scoreSubtitleMatch(release, filename || '', false) - (hi ? 40 : 0),
+          score: scoreSubtitleMatch(release, filename || '', false) - (hi ? 40 : 0) - (packLike ? 60 : 0),
           lang, url: `subsource://${id}`
         }];
       });
       console.log(`[AISUBS] SubSource (${name}): ${items.length} listed -> ${kept.length} usable${epRe ? ' for this episode' : ''}`);
+      if (!kept.length && items.length) console.log('[AISUBS] SubSource sample names:', items.slice(0, 4).map(x => x.releaseInfo ?? x.release_info ?? '?').join(' | '));
       return kept.slice(0, 8);
     } catch (e) {
       console.warn(`[AISUBS] SubSource list (${name}) error:`, e.message);
@@ -806,7 +810,51 @@ async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId, c
 // ----------------------------------------------------
 // Decompression Engine
 // ----------------------------------------------------
-function decompressSubtitleBuffer(buffer) {
+// ---- Episode matching + zip handling (season packs hold one file per episode) ----------------------------
+function episodeRegex(season, episode) {
+  const S = Number(season), E = Number(episode);
+  return new RegExp(`s0*${S}[ ._-]?e0*${E}(?!\\d)|(?:^|[^\\d])${S}x0*${E}(?!\\d)|(?:episode|ep)[ ._-]?0*${E}(?!\\d)`, 'i');
+}
+const EPISODE_MARK_RE = /s\d{1,2}[ ._-]?e\d{1,3}|(?:^|[^\d])\d{1,2}x\d{1,3}(?!\d)|(?:episode|ep)[ ._-]?\d/i;
+const SUB_EXT_RE = /\.(srt|vtt|ass|ssa|sub)$/i;
+function episodeOf(type, id) {
+  if (type !== 'series') return null;
+  const [, S, E] = String(id).split(':');
+  return (Number.isFinite(Number(S)) && Number.isFinite(Number(E)) && S && E) ? { season: Number(S), episode: Number(E) } : null;
+}
+
+// Reads the zip's central directory (reliable sizes), instead of walking local headers.
+function listZipEntries(buffer) {
+  let eocd = -1;
+  for (let i = buffer.length - 22; i >= Math.max(0, buffer.length - 66000); i--) {
+    if (buffer.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return null;
+  const count = buffer.readUInt16LE(eocd + 10);
+  let p = buffer.readUInt32LE(eocd + 16);
+  const entries = [];
+  for (let k = 0; k < count && p + 46 <= buffer.length; k++) {
+    if (buffer.readUInt32LE(p) !== 0x02014b50) break;
+    const nameLen = buffer.readUInt16LE(p + 28), extraLen = buffer.readUInt16LE(p + 30), cmtLen = buffer.readUInt16LE(p + 32);
+    entries.push({
+      name: buffer.slice(p + 46, p + 46 + nameLen).toString('utf-8'),
+      method: buffer.readUInt16LE(p + 10),
+      compSize: buffer.readUInt32LE(p + 20),
+      lho: buffer.readUInt32LE(p + 42)
+    });
+    p += 46 + nameLen + extraLen + cmtLen;
+  }
+  return entries;
+}
+function readZipEntry(buffer, e) {
+  const start = e.lho + 30 + buffer.readUInt16LE(e.lho + 26) + buffer.readUInt16LE(e.lho + 28);
+  const data = buffer.slice(start, start + e.compSize);
+  return e.method === 0 ? data : zlib.inflateRawSync(data);
+}
+
+// `ep` = { season, episode } for series. In a pack we pick that episode's file; if it isn't there we refuse
+// (never fall back to "the first file", which would show another episode's subtitles).
+function decompressSubtitleBuffer(buffer, ep = null) {
   if (buffer.length > 2 && buffer[0] === 0x1f && buffer[1] === 0x8b) {
     try {
       return decodeText(zlib.gunzipSync(buffer));
@@ -818,6 +866,17 @@ function decompressSubtitleBuffer(buffer) {
   }
 
   if (buffer.length > 4 && buffer[0] === 0x50 && buffer[1] === 0x4b && buffer[2] === 0x03 && buffer[3] === 0x04) {
+    const entries = listZipEntries(buffer);
+    if (entries) {
+      const subs = entries.filter(e => SUB_EXT_RE.test(e.name));
+      let pick = subs[0];
+      if (ep && subs.length > 1) {
+        const re = episodeRegex(ep.season, ep.episode);
+        pick = subs.find(e => re.test(e.name.split('/').pop()));
+        if (!pick) throw new Error('Episode not found in subtitle pack');
+      }
+      if (pick) return decodeText(readZipEntry(buffer, pick));
+    }
     try {
       let offset = 0;
       while (offset < buffer.length - 30) {
@@ -1019,7 +1078,7 @@ async function alignToReference({ cues, refUrl, candUrl, config, type, id }) {
     let refIv = refCache.get(refUrl);
     if (!refIv) {
       const { buffer } = await downloadSubtitleWithFallbacks([refUrl], type, id, config);
-      const refCues = parseSubtitleCues(decompressSubtitleBuffer(buffer));
+      const refCues = parseSubtitleCues(decompressSubtitleBuffer(buffer, episodeOf(type, id)));
       if (!refCues || refCues.length < 50) throw new Error('reference subtitle too short');
       refIv = cuesToIntervals(refCues);
       if (refCache.size >= 30) refCache.delete(refCache.keys().next().value);
@@ -1055,12 +1114,27 @@ function wrapSubtitleLine(t) {
   return best > 0 ? `${t.slice(0, best)}\n${t.slice(best + 1)}` : t;
 }
 
+async function fetchCuesFromCandidates(candidates, type, id, config) {
+  const ep = episodeOf(type, id);
+  let lastErr = new Error('No subtitle candidates');
+  for (const url of candidates) {
+    try {
+      const { buffer } = await downloadSubtitleWithFallbacks([url], type, id, config);
+      const cues = parseSubtitleCues(decompressSubtitleBuffer(buffer, ep));
+      if (cues && cues.length) return cues;
+      lastErr = new Error('No subtitle cues found after decompression');
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[AISUBS] Candidate failed: ${e.message}`);
+    }
+  }
+  throw lastErr;
+}
+
 async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
   const ctx = { errors: [] };
   let missed = 0;
-  const { buffer } = await downloadSubtitleWithFallbacks(candidates, type, id, config);
-  const cues = parseSubtitleCues(decompressSubtitleBuffer(buffer));
-  if (!cues || cues.length === 0) throw new Error('No subtitle cues found after decompression');
+  const cues = await fetchCuesFromCandidates(candidates, type, id, config);
   console.log(`[AISUBS] Parsed ${cues.length} cues.`);
 
   if (refUrl && candidates[0] && refUrl !== candidates[0]) {
