@@ -534,11 +534,14 @@ async function subsourceFindTitle(headers, imdbId, season) {
   if (!items.length) return null;
 
   const imdbOf = (i) => String(i.imdbId ?? i.imdb_id ?? i.imdb ?? '');
-  const pick = items.find(i => imdbOf(i) === imdbId)
-    || (season && items.find(i => Number(i.season) === Number(season)))
+  // Series: SubSource lists one entry per season, so the season must match, not just the IMDb id.
+  const seasonOf = (i) => Number(i.season);
+  const pick = (season && (items.find(i => imdbOf(i) === imdbId && seasonOf(i) === Number(season))
+                       || items.find(i => seasonOf(i) === Number(season))))
+    || items.find(i => imdbOf(i) === imdbId)
     || items[0];
   const id = pick?.movieId ?? pick?.id;
-  console.log(`[AISUBS] SubSource title: id=${id} | fields: ${Object.keys(pick || {}).slice(0, 14).join(',')}`);
+  console.log(`[AISUBS] SubSource title: id=${id} season=${pick?.season ?? '-'} | fields: ${Object.keys(pick || {}).slice(0, 14).join(',')}`);
   return id || null;
 }
 
@@ -562,6 +565,7 @@ async function fromSubSource(config, imdbId, season, episode, filename, L) {
         { headers, signal: AbortSignal.timeout(4500) });
       if (!r.ok) { console.warn(`[AISUBS] SubSource list (${name}) HTTP ${r.status}`); return []; }
       const items = listFrom(await r.json());
+      console.log(`[AISUBS] SubSource list (${name}): ${items.length} items${items[0] ? ` | fields: ${Object.keys(items[0]).slice(0, 14).join(',')}` : ''}`);
       if (items.length && !(items[0].subtitleId ?? items[0].id)) {
         console.warn('[AISUBS] SubSource: unexpected item shape, keys:', Object.keys(items[0]).join(','));
       }
