@@ -519,8 +519,8 @@ async function subsourceFindTitle(headers, imdbId, season) {
     }
   };
 
-  let items = await search(`searchType=imdb&q=${encodeURIComponent(imdbId)}`);
-  if (!items.length) items = await search(`searchType=imdb&imdb=${encodeURIComponent(imdbId)}`);
+  // SubSource's reply to the wrong form was: 'imdb parameter is required when searchType is "imdb"'.
+  let items = await search(`searchType=imdb&imdb=${encodeURIComponent(imdbId)}`);
   if (!items.length) {
     try {
       const kind = season ? 'series' : 'movie';
