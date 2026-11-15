@@ -569,18 +569,24 @@ async function fromSubSource(config, imdbId, season, episode, filename, L) {
       if (items.length && !(items[0].subtitleId ?? items[0].id)) {
         console.warn('[AISUBS] SubSource: unexpected item shape, keys:', Object.keys(items[0]).join(','));
       }
-      return items.flatMap(it => {
+      const kept = items.flatMap(it => {
         const id = it.subtitleId ?? it.id;
-        const release = it.releaseInfo ?? it.release_info ?? it.release ?? it.name ?? '';
+        const release = String(it.releaseInfo ?? it.release_info ?? it.release ?? it.name ?? '');
         if (!id) return [];
-        if (epRe && !epRe.test(String(release))) return [];     // series: only this episode
+        // Commentary tracks and "foreign parts only" (forced) subtitles are not full dialogue.
+        if (it.commentary || it.foreignParts) return [];
+        if (epRe && !epRe.test(release)) return [];     // series: only this episode
+        const hi = !!it.hearingImpaired;
         return [{
-          source: 'SubSource', release: String(release) || filename || 'Release',
+          source: 'SubSource', release: `${release || filename || 'Release'}${hi ? ' [HI]' : ''}`,
           isHashMatch: false, isEmbedded: false,
-          score: scoreSubtitleMatch(String(release), filename || '', false),
+          // Hearing-impaired versions (sound descriptions) rank below plain dialogue subtitles.
+          score: scoreSubtitleMatch(release, filename || '', false) - (hi ? 40 : 0),
           lang, url: `subsource://${id}`
         }];
-      }).slice(0, 8);
+      });
+      console.log(`[AISUBS] SubSource (${name}): ${items.length} listed -> ${kept.length} usable${epRe ? ' for this episode' : ''}`);
+      return kept.slice(0, 8);
     } catch (e) {
       console.warn(`[AISUBS] SubSource list (${name}) error:`, e.message);
       return [];
