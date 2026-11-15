@@ -625,8 +625,8 @@ function buildSubtitleTracks({ rankedEn, rankedTarget, targetName, iso3, mkUrl }
     used.add(uid);
     tracks.push({ id: uid, url, lang: iso3, label: uid });
   };
-  // Up to 4 English sources, each its own "translate this one" choice (the best also gets the runner-up as backup).
-  rankedEn.slice(0, 4).forEach((c, i) => {
+  // Up to 5 English sources, each its own "translate this one" choice (the best also gets the runner-up as backup).
+  rankedEn.slice(0, 5).forEach((c, i) => {
     add(`${matchMarker(c)}${c.ready ? ' ⚡' : ''} AI translation from English · ${c.release}`, c.source, mkUrl(c, i === 0 ? rankedEn[1] : null, false));
   });
   // Up to 4 ready-made subtitles in your language: instant, no AI cost.
@@ -694,7 +694,14 @@ app.get(/\/subtitles\//, async (req, res) => {
   const refCand = refPool.filter(c => c.isHashMatch).sort(byQuality)[0]
     || refPool.filter(c => c.score >= STRONG_RELEASE_SCORE).sort(byQuality)[0] || null;
 
-  const rankedEn = candidateSubs.filter(c => L.isEnglish(c.lang)).sort(byQuality);
+  // The menu shows the best subtitle from EACH source first (so every source gets a say), then fills up by quality.
+  const diversify = (ranked, max) => {
+    const picked = [], seen = new Set();
+    for (const c of ranked) if (picked.length < max && !seen.has(c.source)) { seen.add(c.source); picked.push(c); }
+    for (const c of ranked) if (picked.length < max && !picked.includes(c)) picked.push(c);
+    return picked.sort(byQuality);
+  };
+  const rankedEn = diversify(candidateSubs.filter(c => L.isEnglish(c.lang)).sort(byQuality), 5);
   const rankedTarget = candidateSubs.filter(c => L.isTarget(c.lang)).sort(byQuality);
 
   const base = publicBase(req) + (req.tokenPrefix || '');
