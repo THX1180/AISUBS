@@ -567,29 +567,41 @@ async function fromSubSource(config, imdbId, season, episode, filename, L) {
       if (items.length && !(items[0].subtitleId ?? items[0].id)) {
         console.warn('[AISUBS] SubSource: unexpected item shape, keys:', Object.keys(items[0]).join(','));
       }
+      // Flags may arrive as true/false, 1/0 or "true"/"false"; only a real "yes" counts (a text "false" is truthy in JS).
+      const isTrue = (v) => v === true || v === 1 || v === 'true' || v === '1';
+      const dropped = { noId: 0, commentary: 0, foreign: 0, otherEpisode: 0 };
       const kept = items.flatMap(it => {
         const id = it.subtitleId ?? it.id;
-        const release = String(it.releaseInfo ?? it.release_info ?? it.release ?? it.name ?? '');
-        if (!id) return [];
+        if (!id) { dropped.noId++; return []; }
         // Commentary tracks and "foreign parts only" (forced) subtitles are not full dialogue.
-        if (it.commentary || it.foreignParts) return [];
+        if (isTrue(it.commentary)) { dropped.commentary++; return []; }
+        if (isTrue(it.foreignParts)) { dropped.foreign++; return []; }
+
+        // releaseInfo can be one name or a LIST of names (packs). Match against each; show the best-matching one.
+        const names = [].concat(it.releaseInfo ?? it.release_info ?? it.release ?? it.name ?? '').map(String).filter(Boolean);
+        const best = names.map(n => ({ n, sc: scoreSubtitleMatch(n, filename || '', false) })).sort((x, y) => y.sc - x.sc)[0] || { n: '', sc: 0 };
+
         // Series: exact episode names are best. Names with NO episode marker are usually season packs (the right
         // episode is picked from inside the zip). Names that point to a different episode are dropped.
-        const exact = !epRe || epRe.test(release);
-        const packLike = !!epRe && !exact && !EPISODE_MARK_RE.test(release);
-        if (epRe && !exact && !packLike) return [];
+        const exact = !epRe || names.some(n => epRe.test(n));
+        const packLike = !!epRe && !exact && !names.some(n => EPISODE_MARK_RE.test(n));
+        if (epRe && !exact && !packLike) { dropped.otherEpisode++; return []; }
         const pack = packLike && Number(it.files) > 1;
-        const hi = !!it.hearingImpaired;
+        const hi = isTrue(it.hearingImpaired);
         return [{
-          source: 'SubSource', release: `${release || filename || 'Release'}${pack ? ' [season pack]' : ''}${hi ? ' [HI]' : ''}`,
+          source: 'SubSource', release: `${best.n || filename || 'Release'}${pack ? ' [season pack]' : ''}${hi ? ' [HI]' : ''}`,
           isHashMatch: false, isEmbedded: false,
-          // Hearing-impaired versions (sound descriptions) rank below plain dialogue subtitles.
-          score: scoreSubtitleMatch(release, filename || '', false) - (hi ? 40 : 0) - (packLike ? 60 : 0),
+          // Hearing-impaired versions rank below plain dialogue; packs rank below exact-episode files.
+          score: best.sc - (hi ? 40 : 0) - (packLike ? 60 : 0),
           lang, url: `subsource://${id}`
         }];
       });
       console.log(`[AISUBS] SubSource (${name}): ${items.length} listed -> ${kept.length} usable${epRe ? ' for this episode' : ''}`);
-      if (!kept.length && items.length) console.log('[AISUBS] SubSource sample names:', items.slice(0, 4).map(x => x.releaseInfo ?? x.release_info ?? '?').join(' | '));
+      if (!kept.length && items.length) {
+        console.log('[AISUBS] SubSource dropped:', JSON.stringify(dropped));
+        const f = items[0];
+        console.log('[AISUBS] SubSource flag values (first item):', JSON.stringify({ commentary: f.commentary, foreignParts: f.foreignParts, hearingImpaired: f.hearingImpaired, files: f.files, releaseInfoIsList: Array.isArray(f.releaseInfo) }));
+      }
       return kept.slice(0, 8);
     } catch (e) {
       console.warn(`[AISUBS] SubSource list (${name}) error:`, e.message);
