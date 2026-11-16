@@ -625,8 +625,8 @@ function buildSubtitleTracks({ rankedEn, rankedTarget, targetName, iso3, mkUrl }
     used.add(uid);
     tracks.push({ id: uid, url, lang: iso3, label: uid });
   };
-  // Up to 5 English sources, each its own "translate this one" choice (the best also gets the runner-up as backup).
-  rankedEn.slice(0, 5).forEach((c, i) => {
+  // Up to 4 English sources (one per source), each its own "translate this one" choice (the best also gets the runner-up as backup).
+  rankedEn.slice(0, 4).forEach((c, i) => {
     add(`${matchMarker(c)}${c.ready ? ' ⚡' : ''} AI translation from English · ${c.release}`, c.source, mkUrl(c, i === 0 ? rankedEn[1] : null, false));
   });
   // Up to 4 ready-made subtitles in your language: instant, no AI cost.
@@ -701,7 +701,7 @@ app.get(/\/subtitles\//, async (req, res) => {
     for (const c of ranked) if (picked.length < max && !picked.includes(c)) picked.push(c);
     return picked.sort(byQuality);
   };
-  const rankedEn = diversify(candidateSubs.filter(c => L.isEnglish(c.lang)).sort(byQuality), 5);
+  const rankedEn = diversify(candidateSubs.filter(c => L.isEnglish(c.lang)).sort(byQuality), 4);
   const rankedTarget = candidateSubs.filter(c => L.isTarget(c.lang)).sort(byQuality);
 
   const base = publicBase(req) + (req.tokenPrefix || '');
@@ -721,6 +721,9 @@ app.get(/\/subtitles\//, async (req, res) => {
 // ----------------------------------------------------
 // Resilient Multi-Candidate Subtitle Downloader & Live Rescue
 // ----------------------------------------------------
+// Never write API keys into the logs (SubDL puts its key in the download URL).
+const redactUrl = (u) => String(u).replace(/([?&](?:api_key|apikey|key|token)=)[^&]*/gi, '$1***');
+
 async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId, config = {}) {
   let lastError = null;
 
@@ -762,7 +765,7 @@ async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId, c
     }
 
     try {
-      console.log(`[AISUBS] Downloading candidate: ${targetUrl.slice(0, 70)}...`);
+      console.log(`[AISUBS] Downloading candidate: ${redactUrl(targetUrl).slice(0, 70)}...`);
       const res = await fetch(targetUrl, {
         headers: reqHeaders,
         redirect: 'follow',
@@ -801,7 +804,7 @@ async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId, c
 
           for (const s of pool.slice(0, 3)) {
             try {
-              console.log(`[AISUBS] Attempting rescue candidate: ${s.url.slice(0, 70)}...`);
+              console.log(`[AISUBS] Attempting rescue candidate: ${redactUrl(s.url).slice(0, 70)}...`);
               const fileRes = await fetch(s.url, {
                 headers: { 'User-Agent': 'Stremio/4.4.168', 'Accept': '*/*' },
                 redirect: 'follow',
@@ -1150,6 +1153,46 @@ async function fetchCuesFromCandidates(candidates, type, id, config) {
   throw lastErr;
 }
 
+// ---- Shared translations ---------------------------------------------------------------------------------
+// Different sources often serve the SAME subtitle (e.g. SubDL mirrors SubSource). Subtitles with identical text,
+// target language and model share one translation, running or finished, so it is only paid for once.
+async function translateAllTexts(sourceTexts, config) {
+  const ctx = { errors: [] };
+  const batchSize = 100;
+  const batches = [];
+  for (let i = 0; i < sourceTexts.length; i += batchSize) batches.push({ start: i, texts: sourceTexts.slice(i, i + batchSize) });
+  const out = new Array(sourceTexts.length).fill(null);
+
+  await mapPool(batches, TRANSLATE_CONCURRENCY, async (b, bi) => {
+    console.log(`[AISUBS] Translating batch ${bi + 1}/${batches.length} (${b.texts.length} lines)...`);
+    const context = b.start === 0 ? [] : sourceTexts.slice(Math.max(0, b.start - 6), b.start);
+    const translated = await translateBatch(b.texts, config.langName || 'Dutch', config, ctx, context);
+    translated.forEach((t, k) => { out[b.start + k] = t; });
+  });
+  return { translated: out, errors: ctx.errors };
+}
+
+const sharedTranslations = new Map();   // content hash -> Promise<{ translated, errors }>
+function getSharedTranslation(sourceTexts, config) {
+  const h = crypto.createHash('sha1');
+  h.update(`${config.lang}|${config.langName}|${config.provider}|${config.model}\n`);
+  for (const t of sourceTexts) h.update(`${t}\n`);
+  const key = h.digest('hex');
+
+  let p = sharedTranslations.get(key);
+  if (p) {
+    console.log('[AISUBS] Same subtitle text already translated or in progress - reusing it.');
+    return p;
+  }
+  p = translateAllTexts(sourceTexts, config);
+  sharedTranslations.set(key, p);
+  if (sharedTranslations.size > 30) sharedTranslations.delete(sharedTranslations.keys().next().value);
+  // Don't keep a failed run around, so a later try can start fresh.
+  p.then(r => { if (r.translated.filter(x => x == null).length > sourceTexts.length * 0.2) sharedTranslations.delete(key); })
+   .catch(() => sharedTranslations.delete(key));
+  return p;
+}
+
 const translationTimes = [];   // seconds per finished translation (last 50), for the running average in the log
 
 async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
@@ -1173,20 +1216,13 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
   }
 
   if (raw !== 'true') {
-    const batchSize = 100;
-    const batches = [];
-    for (let i = 0; i < cues.length; i += batchSize) batches.push(cues.slice(i, i + batchSize));
-
-    await mapPool(batches, TRANSLATE_CONCURRENCY, async (chunk, bi) => {
-      console.log(`[AISUBS] Translating batch ${bi + 1}/${batches.length} (${chunk.length} lines)...`);
-      const context = bi === 0 ? [] : sourceTexts.slice(Math.max(0, bi * batchSize - 6), bi * batchSize);
-      const translated = await translateBatch(chunk.map(c => c.text), config.langName || 'Dutch', config, ctx, context);
-      chunk.forEach((c, idx) => {
-        const trans = translated[idx];
-        if (trans == null) { missed++; return; }      // keep the original line, but remember it failed
-        const shown = wrapSubtitleLine(trans);
-        c.text = config.bilingual ? `${c.text}\n<c.cyan>${shown}</c>` : shown;
-      });
+    const { translated, errors } = await getSharedTranslation(sourceTexts, config);
+    ctx.errors.push(...errors);
+    cues.forEach((c, i) => {
+      const trans = translated[i];
+      if (trans == null) { missed++; return; }      // keep the original line, but remember it failed
+      const shown = wrapSubtitleLine(trans);
+      c.text = config.bilingual ? `${c.text}\n<c.cyan>${shown}</c>` : shown;
     });
   }
 
