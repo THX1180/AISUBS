@@ -1190,14 +1190,21 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
   const targetName = config.langName || 'Dutch';
   const providerName = config.provider === 'gemini' ? 'Gemini AI' : String(config.provider).toUpperCase();
 
+  // Progress bar, shown as the first subtitle lines. A subtitle file reaches the player only once it is finished,
+  // so this reports the FINAL state of the translation (share of lines translated), not a live fill.
+  const pct = cues.length ? Math.round(100 * (cues.length - missed) / cues.length) : 100;
+  const bar = (p) => `[${'-'.repeat(Math.floor(p / 10))}(${p})%]`;      // 0 -> [(0)%]   25 -> [--(25)%]   100 -> [----------(100)%]
+  const green = (t) => `<c.lime><i>${t}</i></c>`;                       // italic + the standard WebVTT green
+  const plain = (t) => String(t).replace(/[<>&]/g, ' ');
+
   if (raw !== 'true' && missed > cues.length * 0.2) {
-    const reason = (ctx.errors[0] || 'unknown error').slice(0, 140);
+    const reason = plain((ctx.errors[0] || 'unknown error').slice(0, 140));
     console.error(`[AISUBS] Translation failed for ${missed}/${cues.length} cues. First error: ${reason}`);
-    const banner = `[ ⚠ AISUBS: translation to ${targetName} failed - showing original. ${reason} ]`;
+    const banner = green(`${bar(pct)} ✗ ${targetName} translation incomplete - ${reason}`);
     return { vtt: buildWebVTT(cues, banner), cacheable: false };   // don't cache a failure
   }
 
-  const banner = raw === 'true' ? '' : `[ 🤖 AISUBS: Translated to ${targetName} via ${providerName} ]`;
+  const banner = raw === 'true' ? '' : green(`${bar(pct)}${missed === 0 ? ' ✓' : ''}`);
   return { vtt: buildWebVTT(cues, banner), cacheable: true };
 }
 
