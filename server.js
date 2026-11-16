@@ -1150,7 +1150,10 @@ async function fetchCuesFromCandidates(candidates, type, id, config) {
   throw lastErr;
 }
 
+const translationTimes = [];   // seconds per finished translation (last 50), for the running average in the log
+
 async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
+  const t0 = Date.now();
   const ctx = { errors: [] };
   let missed = 0;
   const cues = await fetchCuesFromCandidates(candidates, type, id, config);
@@ -1201,7 +1204,15 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
     return { vtt: buildWebVTT(cues, `Translation failed ✗ (${pct}% translated) - ${reason}`), cacheable: false };   // don't cache a failure
   }
 
-  const banner = raw === 'true' ? '' : (missed === 0 ? 'Translation Succeeded ✓' : `Translation mostly succeeded (${pct}%)`);
+  if (raw !== 'true') {
+    const secs = (Date.now() - t0) / 1000;
+    translationTimes.push(secs);
+    if (translationTimes.length > 50) translationTimes.shift();
+    const avg = translationTimes.reduce((a, b) => a + b, 0) / translationTimes.length;
+    console.log(`[AISUBS] Translation took ${secs.toFixed(1)}s (${cues.length} cues, ${missed} missed) | average ${avg.toFixed(1)}s over ${translationTimes.length} run(s)`);
+  }
+
+  const banner = raw === 'true' ? '' : (missed === 0 ? 'Translation Succeeded ✅' : `Translation mostly succeeded (${pct}%)`);
   return { vtt: buildWebVTT(cues, banner), cacheable: true };
 }
 
