@@ -1190,21 +1190,18 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
   const targetName = config.langName || 'Dutch';
   const providerName = config.provider === 'gemini' ? 'Gemini AI' : String(config.provider).toUpperCase();
 
-  // Progress bar, shown as the first subtitle lines. A subtitle file reaches the player only once it is finished,
-  // so this reports the FINAL state of the translation (share of lines translated), not a live fill.
+  // Status message, plain text. No [square brackets] (some players hide bracketed text as "sound descriptions"),
+  // no colour tags and no emoji besides the check/cross marks.
   const pct = cues.length ? Math.round(100 * (cues.length - missed) / cues.length) : 100;
-  const bar = (p) => `[${'-'.repeat(Math.floor(p / 10))}(${p})%]`;      // 0 -> [(0)%]   25 -> [--(25)%]   100 -> [----------(100)%]
-  const green = (t) => `<c.lime><i>${t}</i></c>`;                       // italic + the standard WebVTT green
   const plain = (t) => String(t).replace(/[<>&]/g, ' ');
 
   if (raw !== 'true' && missed > cues.length * 0.2) {
     const reason = plain((ctx.errors[0] || 'unknown error').slice(0, 140));
     console.error(`[AISUBS] Translation failed for ${missed}/${cues.length} cues. First error: ${reason}`);
-    const banner = green(`${bar(pct)} ✗ ${targetName} translation incomplete - ${reason}`);
-    return { vtt: buildWebVTT(cues, banner), cacheable: false };   // don't cache a failure
+    return { vtt: buildWebVTT(cues, `Translation failed ✗ (${pct}% translated) - ${reason}`), cacheable: false };   // don't cache a failure
   }
 
-  const banner = raw === 'true' ? '' : green(`${bar(pct)}${missed === 0 ? ' ✓' : ''}`);
+  const banner = raw === 'true' ? '' : (missed === 0 ? 'Translation Succeeded ✓' : `Translation mostly succeeded (${pct}%)`);
   return { vtt: buildWebVTT(cues, banner), cacheable: true };
 }
 
@@ -1434,10 +1431,7 @@ function buildWebVTT(cues, bannerText) {
   let cueIndex = 1;
 
   if (bannerText) {
-    // Some players (e.g. Nuvio) attach the external track a few seconds after playback starts, so a short
-    // 0.8-5.5s banner can be over before the track is live. Show it longer, and once more shortly after.
-    vtt += `${cueIndex}\n00:00:00.500 --> 00:00:10.000\n${bannerText}\n\n`;
-    cueIndex++;
+    // Shown from 0:30 to 0:36: players such as Nuvio attach the external track some seconds after playback starts.
     vtt += `${cueIndex}\n00:00:30.000 --> 00:00:36.000\n${bannerText}\n\n`;
     cueIndex++;
   }
