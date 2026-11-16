@@ -1156,8 +1156,12 @@ async function fetchCuesFromCandidates(candidates, type, id, config) {
 // ---- Shared translations ---------------------------------------------------------------------------------
 // Different sources often serve the SAME subtitle (e.g. SubDL mirrors SubSource). Subtitles with identical text,
 // target language and model share one translation, running or finished, so it is only paid for once.
+// List price of Gemini 3.1 Flash-Lite in USD per 1M tokens; override with PRICE_IN_PER_M / PRICE_OUT_PER_M.
+const PRICE_IN_PER_M = Number(process.env.PRICE_IN_PER_M) || 0.25;
+const PRICE_OUT_PER_M = Number(process.env.PRICE_OUT_PER_M) || 1.5;
+
 async function translateAllTexts(sourceTexts, config) {
-  const ctx = { errors: [] };
+  const ctx = { errors: [], usage: { in: 0, out: 0, think: 0 } };
   const batchSize = 100;
   const batches = [];
   for (let i = 0; i < sourceTexts.length; i += batchSize) batches.push({ start: i, texts: sourceTexts.slice(i, i + batchSize) });
@@ -1169,6 +1173,11 @@ async function translateAllTexts(sourceTexts, config) {
     const translated = await translateBatch(b.texts, config.langName || 'Dutch', config, ctx, context);
     translated.forEach((t, k) => { out[b.start + k] = t; });
   });
+  const u = ctx.usage;
+  if (u.in) {
+    const usd = (u.in * PRICE_IN_PER_M + (u.out + u.think) * PRICE_OUT_PER_M) / 1e6;
+    console.log(`[AISUBS] Gemini usage: ${u.in} in, ${u.out} out, ${u.think} thinking = about $${usd.toFixed(4)} (at $${PRICE_IN_PER_M}/$${PRICE_OUT_PER_M} per 1M)`);
+  }
   return { translated: out, errors: ctx.errors };
 }
 
@@ -1182,7 +1191,7 @@ function getSharedTranslation(sourceTexts, config) {
   let p = sharedTranslations.get(key);
   if (p) {
     console.log('[AISUBS] Same subtitle text already translated or in progress - reusing it.');
-    return p;
+    return p.then(r => ({ ...r, reused: true }));
   }
   p = translateAllTexts(sourceTexts, config);
   sharedTranslations.set(key, p);
@@ -1215,8 +1224,10 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
     });
   }
 
+  let wasReused = false;
   if (raw !== 'true') {
-    const { translated, errors } = await getSharedTranslation(sourceTexts, config);
+    const { translated, errors, reused } = await getSharedTranslation(sourceTexts, config);
+    wasReused = !!reused;
     ctx.errors.push(...errors);
     cues.forEach((c, i) => {
       const trans = translated[i];
@@ -1240,7 +1251,7 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
     return { vtt: buildWebVTT(cues, `Translation failed ✗ (${pct}% translated) - ${reason}`), cacheable: false };   // don't cache a failure
   }
 
-  if (raw !== 'true') {
+  if (raw !== 'true' && !wasReused) {
     const secs = (Date.now() - t0) / 1000;
     translationTimes.push(secs);
     if (translationTimes.length > 50) translationTimes.shift();
@@ -1248,7 +1259,7 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
     console.log(`[AISUBS] Translation took ${secs.toFixed(1)}s (${cues.length} cues, ${missed} missed) | average ${avg.toFixed(1)}s over ${translationTimes.length} run(s)`);
   }
 
-  const banner = raw === 'true' ? '' : (missed === 0 ? 'Translation Succeeded ✅' : `Translation mostly succeeded (${pct}%)`);
+  const banner = raw === 'true' ? '' : (missed === 0 ? 'Translation Started ✅' : `Translation Started ✅ (${pct}% translated)`);
   return { vtt: buildWebVTT(cues, banner), cacheable: true };
 }
 
@@ -1373,6 +1384,12 @@ async function translateWithGemini(texts, targetLang, apiKey, model, ctx, contex
         }
 
         const data = await res.json();
+        const um = data.usageMetadata;
+        if (um && ctx.usage) {
+          ctx.usage.in += um.promptTokenCount || 0;
+          ctx.usage.out += um.candidatesTokenCount || 0;
+          ctx.usage.think += um.thoughtsTokenCount || 0;
+        }
         const parts = data.candidates?.[0]?.content?.parts || [];
         const reply = parts.filter(p => p.text && !p.thought).map(p => p.text).join('');
         if (!reply.trim()) {
@@ -1478,8 +1495,7 @@ function buildWebVTT(cues, bannerText) {
   let cueIndex = 1;
 
   if (bannerText) {
-    // Shown from 0:30 to 0:36: players such as Nuvio attach the external track some seconds after playback starts.
-    vtt += `${cueIndex}\n00:00:30.000 --> 00:00:36.000\n${bannerText}\n\n`;
+    vtt += `${cueIndex}\n00:00:00.500 --> 00:00:06.000\n${bannerText}\n\n`;
     cueIndex++;
   }
 
