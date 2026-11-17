@@ -79,6 +79,81 @@ app.use(express.json({ limit: '10mb' }));
 app.get(['/', '/index.html', '/configure', '/:config/configure', '/p/:profile/configure'],
   (req, res) => res.sendFile(path.join(ROOT, 'index.html')));
 app.get('/health', (req, res) => res.send('ok'));
+
+// Status page: not in PUBLIC_PATHS, so it needs the /k-TOKEN address whenever ACCESS_TOKEN is set.
+const STATUS_HTML = String.raw`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0c0d11"><link rel="icon" href="/logo.png"><title>AISUBS status</title>
+<style>
+:root{--bg:#0c0d11;--surface:#14161c;--raised:#1b1e26;--line:#2a2e38;--text:#eceef3;--muted:#8a93a6;--accent:#ffd23f;--ok:#3ddc97;--err:#ff6b6b}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:1.5rem 1rem 3rem;display:flex;justify-content:center}
+main{width:100%;max-width:640px}
+header{display:flex;align-items:center;gap:.9rem;margin-bottom:1.25rem}
+header img{width:48px;height:48px;border-radius:12px}
+h1{font-size:1.5rem;letter-spacing:-.02em;line-height:1.1}
+.sub{color:var(--muted);font-size:.82rem}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:.7rem;margin-bottom:1rem}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:.9rem 1rem}
+.card .k{color:var(--muted);font-size:.78rem}
+.card .v{font-size:1.45rem;font-weight:700;margin-top:.15rem}
+h2{font-size:1rem;margin:1.3rem 0 .5rem}
+.box{background:var(--surface);border:1px solid var(--line);border-radius:14px;overflow:hidden}
+.row{padding:.7rem 1rem;border-top:1px solid var(--line);font-size:.88rem;word-break:break-word}
+.row:first-child{border-top:0}
+.row .m{color:var(--muted);font-size:.78rem;margin-top:.1rem}
+.ok{color:var(--ok)}.bad{color:var(--err)}.muted{color:var(--muted)}
+.kv{display:flex;justify-content:space-between;gap:1rem;padding:.55rem 1rem;border-top:1px solid var(--line);font-size:.88rem}
+.kv:first-child{border-top:0}.kv span:first-child{color:var(--muted)}
+</style></head><body><main>
+<header><img src="/logo.png" alt=""><div><h1>AISUBS status</h1><div class="sub" id="upd">loading...</div></div></header>
+<div class="grid" id="cards"></div>
+<h2>OpenSubtitles</h2><div class="box" id="os"></div>
+<h2>Recent translations</h2><div class="box" id="recent"></div>
+<h2>Recent problems</h2><div class="box" id="errs"></div>
+<p class="sub" style="margin-top:1.2rem" id="foot"></p>
+</main>
+<script>
+function $(id){return document.getElementById(id);}
+function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e;}
+function ago(ms){var s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s ago';if(s<3600)return Math.round(s/60)+' min ago';if(s<86400)return Math.round(s/3600)+' h ago';return Math.round(s/86400)+' d ago';}
+function dur(s){if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.round(s%60)+'s';return Math.floor(s/3600)+'h '+Math.round((s%3600)/60)+'m';}
+function usd(x){return '$'+(x<1?x.toFixed(4):x.toFixed(2));}
+function title(id){var p=String(id).split(':');return p.length>=3?p[0]+' S'+String(p[1]).padStart(2,'0')+'E'+String(p[2]).padStart(2,'0'):String(id);}
+function card(k,v){var c=el('div','card');c.appendChild(el('div','k',k));c.appendChild(el('div','v',v));return c;}
+function kv(box,k,v,cls){var r=el('div','kv');r.appendChild(el('span','',k));r.appendChild(el('span',cls||'',v));box.appendChild(r);}
+function render(d){
+  var t=d.totals;
+  var c=$('cards');c.textContent='';
+  c.appendChild(card('Cost since restart',usd(t.usd)));
+  c.appendChild(card('Translations',String(t.count)+(t.failed?' ('+t.failed+' failed)':'')));
+  c.appendChild(card('Average time',t.count?dur(t.avgSecs):'-'));
+  c.appendChild(card('Server uptime',dur(d.uptimeSec)));
+  var os=$('os');os.textContent='';var o=d.openSubtitles;
+  kv(os,'Login',o.loginAt?'OK ('+o.user+')':(o.lastLoginError?'failed':'not used yet'),o.loginAt?'ok':(o.lastLoginError?'bad':'muted'));
+  if(o.allowance!==null)kv(os,'Daily allowance',String(o.allowance)+(o.vip?' (VIP)':''));
+  if(o.remaining!==null)kv(os,'Downloads left',String(o.remaining));
+  if(o.lastLoginError)kv(os,'Last login error',o.lastLoginError,'bad');
+  kv(os,'Quota',o.quotaUsedUntil?'used up - hidden until 00:00 UTC':'available',o.quotaUsedUntil?'bad':'ok');
+  var rc=$('recent');rc.textContent='';
+  if(!d.recent.length){rc.appendChild(el('div','row muted','Nothing translated since the last restart.'));}
+  d.recent.slice(0,10).forEach(function(e){
+    var r=el('div','row');
+    var h=el('div','',(e.ok?'\u2705 ':'\u274C ')+title(e.id));r.appendChild(h);
+    r.appendChild(el('div','m',e.cues+' lines'+(e.missed?' ('+e.missed+' missed)':'')+' \u00B7 '+dur(e.secs)+' \u00B7 '+usd(e.usd)+' \u00B7 '+(e.model||'')+' \u00B7 '+ago(d.now-e.at)));
+    rc.appendChild(r);
+  });
+  var er=$('errs');er.textContent='';
+  if(!d.errors.length){er.appendChild(el('div','row ok','No problems recorded.'));}
+  d.errors.slice(0,8).forEach(function(e){var r=el('div','row');r.appendChild(el('div','bad',e.text));r.appendChild(el('div','m',ago(d.now-e.at)));er.appendChild(r);});
+  $('upd').textContent='Updated '+new Date(d.now).toLocaleTimeString()+' \u00B7 since last restart \u00B7 refreshes every 15s';
+  $('foot').textContent='Server default model '+d.model+' \u00B7 '+d.savedTranslations+' saved translations in memory \u00B7 pace '+d.pacing.minIntervalMs+' ms, '+d.pacing.concurrency+' at a time \u00B7 prices $'+d.prices.inPerM+' in / $'+d.prices.outPerM+' out per 1M tokens';
+}
+function load(){fetch('status.json',{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(render).catch(function(e){$('upd').textContent='Could not load: '+e.message;});}
+load();setInterval(load,15000);
+</script></body></html>`;
+app.get('/status.json', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.json(statusSnapshot()); });
+app.get('/status', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.type('html').send(STATUS_HTML); });
 app.get('/style.css', (req, res) => res.sendFile(path.join(ROOT, 'style.css')));
 app.get('/logo.png', (req, res) => res.sendFile(path.join(ROOT, 'logo.png')));
 
@@ -676,7 +751,8 @@ app.get(/\/subtitles\//, async (req, res) => {
 
   const settled = await Promise.allSettled(jobs);
   settled.forEach(s => s.status === 'rejected' && console.warn('[AISUBS] provider error:', s.reason?.message));
-  const candidateSubs = settled.flatMap(s => (s.status === 'fulfilled' ? s.value : []));
+  let candidateSubs = settled.flatMap(s => (s.status === 'fulfilled' ? s.value : []));
+  if (Date.now() < osQuotaUntil) candidateSubs = candidateSubs.filter(c => !String(c.url).startsWith('os://'));
   console.log('[AISUBS] candidates by source:', JSON.stringify(candidateSubs.reduce((m, c) => (m[c.source] = (m[c.source] || 0) + 1, m), {})));
 
   // Exact-file matches first, then human-made before machine-made, then release-name score.
@@ -721,6 +797,48 @@ app.get(/\/subtitles\//, async (req, res) => {
 // ----------------------------------------------------
 // Resilient Multi-Candidate Subtitle Downloader & Live Rescue
 // ----------------------------------------------------
+// ---- OpenSubtitles login for downloads ----------------------------------------------------------------------
+// Without a login the API allows only a handful of downloads a day. With the account details from the page, the
+// server signs in once (token kept ~20h in memory) and sends it with every download.
+const osTokens = new Map();    // username -> { token, base, until }
+let osQuotaUntil = 0;          // while now < this, OpenSubtitles downloads are known to be used up (until 00:00 UTC)
+
+function markOsQuotaUsed() {
+  const d = new Date();
+  osQuotaUntil = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
+  console.log('[AISUBS] OpenSubtitles daily downloads used up - hiding its tracks until 00:00 UTC.');
+  recordError('OpenSubtitles daily downloads used up - its tracks are hidden until 00:00 UTC.');
+}
+
+async function getOsAuth(config) {
+  if (!config.osApiKey || !config.osUsername || !config.osPassword) return null;
+  const cached = osTokens.get(config.osUsername);
+  if (cached && cached.until > Date.now()) return cached;
+  try {
+    const r = await fetch('https://api.opensubtitles.com/api/v1/login', {
+      method: 'POST',
+      headers: { 'Api-Key': config.osApiKey, 'User-Agent': 'AISUBS v2.5.0', 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ username: config.osUsername, password: config.osPassword }),
+      signal: AbortSignal.timeout(7000)
+    });
+    const j = await r.json();
+    if (!r.ok || !j.token) {
+      console.warn(`[AISUBS] OpenSubtitles login failed (HTTP ${r.status}): ${j.message || 'check username/password'} - downloading without login.`);
+      stats.os.lastLoginError = `HTTP ${r.status}: ${j.message || 'check username/password'}`;
+      recordError(`OpenSubtitles login failed: ${stats.os.lastLoginError}`);
+      return null;
+    }
+    const entry = { token: j.token, base: j.base_url ? `https://${j.base_url}` : 'https://api.opensubtitles.com', until: Date.now() + 20 * 3600 * 1000 };
+    osTokens.set(config.osUsername, entry);
+    console.log(`[AISUBS] OpenSubtitles login OK (${config.osUsername}): daily allowance ${j.user?.allowed_downloads ?? '?'}${j.user?.vip ? ', VIP' : ''}.`);
+    Object.assign(stats.os, { user: config.osUsername, allowance: j.user?.allowed_downloads ?? null, vip: !!j.user?.vip, loginAt: Date.now(), lastLoginError: null });
+    return entry;
+  } catch (e) {
+    console.warn('[AISUBS] OpenSubtitles login error:', e.message, '- downloading without login.');
+    return null;
+  }
+}
+
 // Never write API keys into the logs (SubDL puts its key in the download URL).
 const redactUrl = (u) => String(u).replace(/([?&](?:api_key|apikey|key|token)=)[^&]*/gi, '$1***');
 
@@ -734,21 +852,30 @@ async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId, c
     if (targetUrl.startsWith('os://')) {
       try {
         const fileId = targetUrl.slice(5);
-        const dlPost = await fetch('https://api.opensubtitles.com/api/v1/download', {
+        const auth = await getOsAuth(config);
+        const dlPost = await fetch(`${auth?.base || 'https://api.opensubtitles.com'}/api/v1/download`, {
           method: 'POST',
           headers: {
             'Api-Key': config.osApiKey,
+            ...(auth ? { Authorization: `Bearer ${auth.token}` } : {}),
             'User-Agent': 'AISUBS v2.5.0',
             'Content-Type': 'application/json',
             'Accept': 'application/json'
           },
           body: JSON.stringify({ file_id: Number(fileId) }),
-          signal: AbortSignal.timeout(5000)
+          signal: AbortSignal.timeout(6000)
         });
+        if (dlPost.status === 401 && auth) osTokens.delete(config.osUsername);   // expired token: log in again next time
         const dlJson = await dlPost.json();
         if (!dlJson.link) {
-          console.warn('[AISUBS] OpenSubtitles download returned no link:', dlJson.message || '');
+          const msg = String(dlJson.message || '');
+          console.warn('[AISUBS] OpenSubtitles download returned no link:', msg);
+          if (/allowed \d+ subtitles|quota|24h/i.test(msg)) markOsQuotaUsed();
           continue;
+        }
+        if (dlJson.remaining !== undefined) {
+          console.log(`[AISUBS] OpenSubtitles downloads left today: ${dlJson.remaining}${auth ? '' : ' (no login sent)'}`);
+          stats.os.remaining = dlJson.remaining;
         }
         targetUrl = dlJson.link;
       } catch (e) {
@@ -1148,9 +1275,52 @@ async function fetchCuesFromCandidates(candidates, type, id, config) {
     } catch (e) {
       lastErr = e;
       console.warn(`[AISUBS] Candidate failed: ${e.message}`);
+      recordError(`Subtitle download failed for ${id}: ${e.message}`);
     }
   }
   throw lastErr;
+}
+
+// ---- Status page data (kept in memory; resets on restart) -----------------------------------------------------
+const stats = {
+  startedAt: Date.now(),
+  totals: { count: 0, failed: 0, inTok: 0, outTok: 0, thinkTok: 0, usd: 0, secs: 0 },
+  recent: [],    // newest first, max 50
+  errors: [],    // newest first, max 20
+  os: { user: null, allowance: null, vip: false, loginAt: null, remaining: null, lastLoginError: null }
+};
+function recordError(text) {
+  stats.errors.unshift({ at: Date.now(), text: String(text).slice(0, 220) });
+  if (stats.errors.length > 20) stats.errors.pop();
+}
+function recordTranslation(e) {
+  stats.recent.unshift({ at: Date.now(), ...e });
+  if (stats.recent.length > 50) stats.recent.pop();
+  stats.totals.count++;
+  if (!e.ok) stats.totals.failed++;
+  stats.totals.secs += e.secs;
+}
+function recordUsage(usage, usd) {
+  if (!usage) return;
+  stats.totals.inTok += usage.in || 0;
+  stats.totals.outTok += usage.out || 0;
+  stats.totals.thinkTok += usage.think || 0;
+  stats.totals.usd += usd || 0;
+}
+function statusSnapshot() {
+  const now = Date.now();
+  const t = stats.totals;
+  return {
+    now, startedAt: stats.startedAt, uptimeSec: Math.round((now - stats.startedAt) / 1000),
+    model: GEMINI_DEFAULT_MODEL,
+    pacing: { minIntervalMs: GEMINI_MIN_INTERVAL_MS, concurrency: TRANSLATE_CONCURRENCY },
+    prices: { inPerM: PRICE_IN_PER_M, outPerM: PRICE_OUT_PER_M },
+    totals: { ...t, avgSecs: t.count ? t.secs / t.count : 0 },
+    savedTranslations: subCache.size,
+    recent: stats.recent,
+    errors: stats.errors,
+    openSubtitles: { ...stats.os, quotaUsedUntil: osQuotaUntil > now ? osQuotaUntil : null }
+  };
 }
 
 // ---- Shared translations ---------------------------------------------------------------------------------
@@ -1174,11 +1344,11 @@ async function translateAllTexts(sourceTexts, config) {
     translated.forEach((t, k) => { out[b.start + k] = t; });
   });
   const u = ctx.usage;
+  const usd = (u.in * PRICE_IN_PER_M + (u.out + u.think) * PRICE_OUT_PER_M) / 1e6;
   if (u.in) {
-    const usd = (u.in * PRICE_IN_PER_M + (u.out + u.think) * PRICE_OUT_PER_M) / 1e6;
     console.log(`[AISUBS] Gemini usage: ${u.in} in, ${u.out} out, ${u.think} thinking = about $${usd.toFixed(4)} (at $${PRICE_IN_PER_M}/$${PRICE_OUT_PER_M} per 1M)`);
   }
-  return { translated: out, errors: ctx.errors };
+  return { translated: out, errors: ctx.errors, usage: u, usd };
 }
 
 const sharedTranslations = new Map();   // content hash -> Promise<{ translated, errors }>
@@ -1225,9 +1395,12 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
   }
 
   let wasReused = false;
+  let sharedInfo = null;
   if (raw !== 'true') {
-    const { translated, errors, reused } = await getSharedTranslation(sourceTexts, config);
+    const { translated, errors, reused, usage, usd } = await getSharedTranslation(sourceTexts, config);
     wasReused = !!reused;
+    if (!reused) recordUsage(usage, usd);        // money is spent even when a run fails
+    sharedInfo = { usd: reused ? 0 : (usd || 0) };
     ctx.errors.push(...errors);
     cues.forEach((c, i) => {
       const trans = translated[i];
@@ -1248,6 +1421,8 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
   if (raw !== 'true' && missed > cues.length * 0.2) {
     const reason = plain((ctx.errors[0] || 'unknown error').slice(0, 140));
     console.error(`[AISUBS] Translation failed for ${missed}/${cues.length} cues. First error: ${reason}`);
+    recordError(`Translation failed for ${id}: ${reason}`);
+    if (!wasReused) recordTranslation({ id, type, cues: cues.length, missed, secs: (Date.now() - t0) / 1000, usd: sharedInfo?.usd || 0, model: config.model, ok: false });
     return { vtt: buildWebVTT(cues, `Translation failed ✗ (${pct}% translated) - ${reason}`), cacheable: false };   // don't cache a failure
   }
 
@@ -1256,6 +1431,7 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
     translationTimes.push(secs);
     if (translationTimes.length > 50) translationTimes.shift();
     const avg = translationTimes.reduce((a, b) => a + b, 0) / translationTimes.length;
+    recordTranslation({ id, type, cues: cues.length, missed, secs, usd: sharedInfo?.usd || 0, model: config.model, ok: true });
     console.log(`[AISUBS] Translation took ${secs.toFixed(1)}s (${cues.length} cues, ${missed} missed) | average ${avg.toFixed(1)}s over ${translationTimes.length} run(s)`);
   }
 

@@ -236,6 +236,10 @@
             📺 TV Link
           </button>
 
+          <a id="statusLink" class="btn btn-secondary" href="/status" target="_blank" rel="noopener" style="text-decoration:none">
+            📊 Status
+          </a>
+
           <button type="button" id="qrBtn" class="btn btn-icon" title="Scan QR Code for Android / TV">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
           </button>
@@ -286,6 +290,7 @@
 
     // Token prefix (/k-TOKEN) taken from the page address, so API calls and install links carry it.
     const TOKEN_PREFIX = (location.pathname.match(/^\/k-[A-Za-z0-9]+/) || [''])[0];
+    document.getElementById('statusLink').href = TOKEN_PREFIX + '/status';   // same /k-TOKEN address as this page
 
     // ---- Model dropdown -------------------------------------------------
     // modelInput (hidden unless "Custom") remains the value every other function reads/saves.
