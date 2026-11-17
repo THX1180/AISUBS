@@ -105,8 +105,10 @@ h2{font-size:1rem;margin:1.3rem 0 .5rem}
 .ok{color:var(--ok)}.bad{color:var(--err)}.muted{color:var(--muted)}
 .kv{display:flex;justify-content:space-between;gap:1rem;padding:.55rem 1rem;border-top:1px solid var(--line);font-size:.88rem}
 .kv:first-child{border-top:0}.kv span:first-child{color:var(--muted)}
+.cur{margin-left:auto;background:var(--raised);color:var(--text);border:1px solid var(--line);border-radius:999px;padding:.45rem .85rem;font-size:.85rem;cursor:pointer;white-space:nowrap}
+.cur:hover{border-color:var(--accent);color:var(--accent)}
 </style></head><body><main>
-<header><img src="/logo.png" alt=""><div><h1>AISUBS status</h1><div class="sub" id="upd">loading...</div></div></header>
+<header><img src="/logo.png" alt=""><div><h1>AISUBS status</h1><div class="sub" id="upd">loading...</div></div><button class="cur" id="cur" type="button">Show in \u20AC</button></header>
 <div class="grid" id="cards"></div>
 <h2>OpenSubtitles</h2><div class="box" id="os"></div>
 <h2>Recent translations</h2><div class="box" id="recent"></div>
@@ -118,14 +120,18 @@ function $(id){return document.getElementById(id);}
 function el(tag,cls,text){var e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e;}
 function ago(ms){var s=Math.max(0,Math.round(ms/1000));if(s<60)return s+'s ago';if(s<3600)return Math.round(s/60)+' min ago';if(s<86400)return Math.round(s/3600)+' h ago';return Math.round(s/86400)+' d ago';}
 function dur(s){if(s<60)return Math.round(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.round(s%60)+'s';return Math.floor(s/3600)+'h '+Math.round((s%3600)/60)+'m';}
-function usd(x){return '$'+(x<1?x.toFixed(4):x.toFixed(2));}
+var cur='USD';try{cur=localStorage.getItem('aisubsCur')||'USD';}catch(e){}
+var fx={eurPerUsd:0.86};var last=null;
+function money(x){var v=cur==='EUR'?x*fx.eurPerUsd:x;return (cur==='EUR'?'\u20AC':'$')+(v<1?v.toFixed(4):v.toFixed(2));}
+$('cur').onclick=function(){cur=cur==='EUR'?'USD':'EUR';try{localStorage.setItem('aisubsCur',cur);}catch(e){}if(last)render(last);};
 function title(id){var p=String(id).split(':');return p.length>=3?p[0]+' S'+String(p[1]).padStart(2,'0')+'E'+String(p[2]).padStart(2,'0'):String(id);}
 function card(k,v){var c=el('div','card');c.appendChild(el('div','k',k));c.appendChild(el('div','v',v));return c;}
 function kv(box,k,v,cls){var r=el('div','kv');r.appendChild(el('span','',k));r.appendChild(el('span',cls||'',v));box.appendChild(r);}
 function render(d){
-  var t=d.totals;
+  var t=d.totals;fx=d.fx||fx;last=d;
+  $('cur').textContent=cur==='EUR'?'Show in $':'Show in \u20AC';
   var c=$('cards');c.textContent='';
-  c.appendChild(card('Cost since restart',usd(t.usd)));
+  c.appendChild(card('Cost since restart',money(t.usd)));
   c.appendChild(card('Translations',String(t.count)+(t.failed?' ('+t.failed+' failed)':'')));
   c.appendChild(card('Average time',t.count?dur(t.avgSecs):'-'));
   c.appendChild(card('Server uptime',dur(d.uptimeSec)));
@@ -140,19 +146,21 @@ function render(d){
   d.recent.slice(0,10).forEach(function(e){
     var r=el('div','row');
     var h=el('div','',(e.ok?'\u2705 ':'\u274C ')+title(e.id));r.appendChild(h);
-    r.appendChild(el('div','m',e.cues+' lines'+(e.missed?' ('+e.missed+' missed)':'')+' \u00B7 '+dur(e.secs)+' \u00B7 '+usd(e.usd)+' \u00B7 '+(e.model||'')+' \u00B7 '+ago(d.now-e.at)));
+    r.appendChild(el('div','m',e.cues+' lines'+(e.missed?' ('+e.missed+' missed)':'')+' \u00B7 '+dur(e.secs)+' \u00B7 '+money(e.usd)+' \u00B7 '+(e.model||'')+' \u00B7 '+ago(d.now-e.at)));
     rc.appendChild(r);
   });
   var er=$('errs');er.textContent='';
   if(!d.errors.length){er.appendChild(el('div','row ok','No problems recorded.'));}
   d.errors.slice(0,8).forEach(function(e){var r=el('div','row');r.appendChild(el('div','bad',e.text));r.appendChild(el('div','m',ago(d.now-e.at)));er.appendChild(r);});
   $('upd').textContent='Updated '+new Date(d.now).toLocaleTimeString()+' \u00B7 since last restart \u00B7 refreshes every 15s';
-  $('foot').textContent='Server default model '+d.model+' \u00B7 '+d.savedTranslations+' saved translations in memory \u00B7 pace '+d.pacing.minIntervalMs+' ms, '+d.pacing.concurrency+' at a time \u00B7 prices $'+d.prices.inPerM+' in / $'+d.prices.outPerM+' out per 1M tokens';
+  var used={};d.recent.forEach(function(e){String(e.model).split(' + ').forEach(function(m){used[m]=1;});});
+  var pr=Object.keys(used).map(function(m){var p=d.prices[m];return p?m+' $'+p[0]+' in / $'+p[1]+' out':m+' (price not in table, Flash-Lite rate used)';}).join(' \u00B7 ');
+  $('foot').textContent=(t.aliased?t.aliased+' duplicate track requests skipped \u00B7 ':'')+'Server default model '+d.model+' \u00B7 '+d.savedTranslations+' saved translations in memory \u00B7 pace '+d.pacing.minIntervalMs+' ms, '+d.pacing.concurrency+' at a time \u00B7 prices per 1M tokens: '+(pr||'none used yet')+' \u00B7 1 USD = '+fx.eurPerUsd.toFixed(4)+' EUR ('+fx.source+(fx.date?' '+fx.date:'')+')';
 }
 function load(){fetch('status.json',{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(render).catch(function(e){$('upd').textContent='Could not load: '+e.message;});}
 load();setInterval(load,15000);
 </script></body></html>`;
-app.get('/status.json', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.json(statusSnapshot()); });
+app.get('/status.json', async (req, res) => { res.setHeader('Cache-Control', 'no-store'); await refreshFx(); res.json(statusSnapshot()); });
 app.get('/status', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.type('html').send(STATUS_HTML); });
 app.get('/style.css', (req, res) => res.sendFile(path.join(ROOT, 'style.css')));
 app.get('/logo.png', (req, res) => res.sendFile(path.join(ROOT, 'logo.png')));
@@ -1284,7 +1292,7 @@ async function fetchCuesFromCandidates(candidates, type, id, config) {
 // ---- Status page data (kept in memory; resets on restart) -----------------------------------------------------
 const stats = {
   startedAt: Date.now(),
-  totals: { count: 0, failed: 0, inTok: 0, outTok: 0, thinkTok: 0, usd: 0, secs: 0 },
+  totals: { count: 0, failed: 0, aliased: 0, inTok: 0, outTok: 0, thinkTok: 0, usd: 0, secs: 0 },
   recent: [],    // newest first, max 50
   errors: [],    // newest first, max 20
   os: { user: null, allowance: null, vip: false, loginAt: null, remaining: null, lastLoginError: null }
@@ -1307,6 +1315,24 @@ function recordUsage(usage, usd) {
   stats.totals.thinkTok += usage.think || 0;
   stats.totals.usd += usd || 0;
 }
+// EUR conversion for the status page: ECB reference rate via Frankfurter (free, no key), refreshed twice a day.
+// If the lookup fails, the last known rate (or EUR_PER_USD, default 0.86) is used and the page says so.
+const fxState = { eurPerUsd: Number(process.env.EUR_PER_USD) || 0.86, date: null, source: 'fallback rate', nextTry: 0 };
+async function refreshFx() {
+  const now = Date.now();
+  if (now < fxState.nextTry) return;
+  fxState.nextTry = now + 3600e3;   // if this fails, try again in an hour
+  try {
+    const r = await fetch('https://api.frankfurter.dev/v1/latest?base=USD&symbols=EUR', { signal: AbortSignal.timeout(4000) });
+    const j = await r.json();
+    const rate = Number(j?.rates?.EUR);
+    if (!r.ok || !(rate > 0.3 && rate < 3)) throw new Error('unexpected reply');
+    Object.assign(fxState, { eurPerUsd: rate, date: j.date || null, source: 'ECB via Frankfurter', nextTry: now + 12 * 3600e3 });
+  } catch (e) {
+    console.warn('[AISUBS] Exchange rate lookup failed:', e.message);
+  }
+}
+
 function statusSnapshot() {
   const now = Date.now();
   const t = stats.totals;
@@ -1314,7 +1340,8 @@ function statusSnapshot() {
     now, startedAt: stats.startedAt, uptimeSec: Math.round((now - stats.startedAt) / 1000),
     model: GEMINI_DEFAULT_MODEL,
     pacing: { minIntervalMs: GEMINI_MIN_INTERVAL_MS, concurrency: TRANSLATE_CONCURRENCY },
-    prices: { inPerM: PRICE_IN_PER_M, outPerM: PRICE_OUT_PER_M },
+    prices: GEMINI_PRICES,
+    fx: { eurPerUsd: fxState.eurPerUsd, date: fxState.date, source: fxState.source },
     totals: { ...t, avgSecs: t.count ? t.secs / t.count : 0 },
     savedTranslations: subCache.size,
     recent: stats.recent,
@@ -1326,12 +1353,22 @@ function statusSnapshot() {
 // ---- Shared translations ---------------------------------------------------------------------------------
 // Different sources often serve the SAME subtitle (e.g. SubDL mirrors SubSource). Subtitles with identical text,
 // target language and model share one translation, running or finished, so it is only paid for once.
-// List price of Gemini 3.1 Flash-Lite in USD per 1M tokens; override with PRICE_IN_PER_M / PRICE_OUT_PER_M.
-const PRICE_IN_PER_M = Number(process.env.PRICE_IN_PER_M) || 0.25;
-const PRICE_OUT_PER_M = Number(process.env.PRICE_OUT_PER_M) || 1.5;
+// USD per 1M tokens [input, output], from Google's published list prices (Nov 2026). Thinking tokens are billed as output.
+// Prices change: set PRICE_IN_PER_M and PRICE_OUT_PER_M in Render to override the table for every model.
+const GEMINI_PRICES = {
+  'gemini-3.1-flash-lite': [0.25, 1.5],
+  'gemini-3.5-flash-lite': [0.30, 2.5],
+  'gemini-3.5-flash': [1.5, 9.0],
+  'gemini-3.6-flash': [1.5, 7.5]
+};
+function priceFor(model) {
+  const envIn = Number(process.env.PRICE_IN_PER_M), envOut = Number(process.env.PRICE_OUT_PER_M);
+  if (envIn > 0 && envOut > 0) return [envIn, envOut];
+  return GEMINI_PRICES[model] || GEMINI_PRICES['gemini-3.1-flash-lite'];   // unknown model: assume Flash-Lite rates
+}
 
 async function translateAllTexts(sourceTexts, config) {
-  const ctx = { errors: [], usage: { in: 0, out: 0, think: 0 } };
+  const ctx = { errors: [], usage: { in: 0, out: 0, think: 0 }, usageByModel: {} };
   const batchSize = 100;
   const batches = [];
   for (let i = 0; i < sourceTexts.length; i += batchSize) batches.push({ start: i, texts: sourceTexts.slice(i, i + batchSize) });
@@ -1344,11 +1381,15 @@ async function translateAllTexts(sourceTexts, config) {
     translated.forEach((t, k) => { out[b.start + k] = t; });
   });
   const u = ctx.usage;
-  const usd = (u.in * PRICE_IN_PER_M + (u.out + u.think) * PRICE_OUT_PER_M) / 1e6;
-  if (u.in) {
-    console.log(`[AISUBS] Gemini usage: ${u.in} in, ${u.out} out, ${u.think} thinking = about $${usd.toFixed(4)} (at $${PRICE_IN_PER_M}/$${PRICE_OUT_PER_M} per 1M)`);
+  let usd = 0;
+  const models = Object.keys(ctx.usageByModel);
+  for (const m of models) {
+    const t = ctx.usageByModel[m], [pin, pout] = priceFor(m);
+    const cost = (t.in * pin + (t.out + t.think) * pout) / 1e6;
+    usd += cost;
+    console.log(`[AISUBS] Gemini usage (${m}): ${t.in} in, ${t.out} out, ${t.think} thinking = about $${cost.toFixed(4)} (at $${pin}/$${pout} per 1M)`);
   }
-  return { translated: out, errors: ctx.errors, usage: u, usd };
+  return { translated: out, errors: ctx.errors, usage: u, usd, models };
 }
 
 const sharedTranslations = new Map();   // content hash -> Promise<{ translated, errors }>
@@ -1397,10 +1438,10 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
   let wasReused = false;
   let sharedInfo = null;
   if (raw !== 'true') {
-    const { translated, errors, reused, usage, usd } = await getSharedTranslation(sourceTexts, config);
+    const { translated, errors, reused, usage, usd, models } = await getSharedTranslation(sourceTexts, config);
     wasReused = !!reused;
     if (!reused) recordUsage(usage, usd);        // money is spent even when a run fails
-    sharedInfo = { usd: reused ? 0 : (usd || 0) };
+    sharedInfo = { usd: reused ? 0 : (usd || 0), models: reused ? [] : (models || []) };
     ctx.errors.push(...errors);
     cues.forEach((c, i) => {
       const trans = translated[i];
@@ -1422,7 +1463,7 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
     const reason = plain((ctx.errors[0] || 'unknown error').slice(0, 140));
     console.error(`[AISUBS] Translation failed for ${missed}/${cues.length} cues. First error: ${reason}`);
     recordError(`Translation failed for ${id}: ${reason}`);
-    if (!wasReused) recordTranslation({ id, type, cues: cues.length, missed, secs: (Date.now() - t0) / 1000, usd: sharedInfo?.usd || 0, model: config.model, ok: false });
+    if (!wasReused) recordTranslation({ id, type, cues: cues.length, missed, secs: (Date.now() - t0) / 1000, usd: sharedInfo?.usd || 0, model: sharedInfo?.models?.length ? sharedInfo.models.join(' + ') : config.model, ok: false });
     return { vtt: buildWebVTT(cues, `Translation failed ✗ (${pct}% translated) - ${reason}`), cacheable: false };   // don't cache a failure
   }
 
@@ -1431,7 +1472,7 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
     translationTimes.push(secs);
     if (translationTimes.length > 50) translationTimes.shift();
     const avg = translationTimes.reduce((a, b) => a + b, 0) / translationTimes.length;
-    recordTranslation({ id, type, cues: cues.length, missed, secs, usd: sharedInfo?.usd || 0, model: config.model, ok: true });
+    recordTranslation({ id, type, cues: cues.length, missed, secs, usd: sharedInfo?.usd || 0, model: sharedInfo?.models?.length ? sharedInfo.models.join(' + ') : config.model, ok: true });
     console.log(`[AISUBS] Translation took ${secs.toFixed(1)}s (${cues.length} cues, ${missed} missed) | average ${avg.toFixed(1)}s over ${translationTimes.length} run(s)`);
   }
 
@@ -1444,6 +1485,25 @@ function vttCacheKey(config, candidates, id, raw) {
   return `${candidates[0] || id}_${config.lang}_${config.provider}_${config.model}_${config.offsetMs}_${config.bilingual}_${raw === 'true' ? 'raw' : 'ai'}`;
 }
 
+// ---- Burst guard ---------------------------------------------------------------------------------------------
+// Some players ask for EVERY track the addon lists, right after a title opens (nobody can pick 4 tracks in a second).
+// Translating each one would be paid for several times. So: the first AI track of a title is translated normally;
+// other AI tracks of the SAME title asked for within BURST_WINDOW_SEC (or while the first is still running) get the
+// first track's translation instead. Later, deliberate picks translate their own source as usual.
+// Set BURST_WINDOW_SEC=0 in Render to turn this off.
+const BURST_WINDOW_MS = (process.env.BURST_WINDOW_SEC !== undefined && process.env.BURST_WINDOW_SEC !== '' ? Number(process.env.BURST_WINDOW_SEC) : 25) * 1000;
+const titleBursts = new Map();   // title key -> { cacheKey, startedAt, running, promise }
+
+function noteBurst(titleKey, cacheKey, promise, running) {
+  const now = Date.now();
+  const cur = titleBursts.get(titleKey);
+  if (cur && (cur.running || now - cur.startedAt <= BURST_WINDOW_MS)) return null;   // a first track is already active
+  const rec = { cacheKey, startedAt: now, running, promise };
+  titleBursts.set(titleKey, rec);
+  if (titleBursts.size > 200) titleBursts.delete(titleBursts.keys().next().value);
+  return rec;
+}
+
 app.get('/sub.vtt', async (req, res) => {
   const { cfg, src, alt, ref, type, id, raw } = req.query;
   const config = parseConfig(cfg);
@@ -1453,17 +1513,35 @@ app.get('/sub.vtt', async (req, res) => {
   res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
   res.setHeader('Access-Control-Allow-Origin', '*');
 
+  const isAi = raw !== 'true';
+  const titleKey = `${type}|${id}|${config.lang}|${config.provider}|${config.model}|${config.bilingual}|${config.offsetMs}`;
+  console.log(`[AISUBS] Track request (${isAi ? 'AI' : 'native'}) from ${String(req.get('user-agent') || '?').slice(0, 70)}`);
+
   const cacheKey = vttCacheKey(config, candidates, id, raw);
-  if (subCache.has(cacheKey)) return res.send(subCache.get(cacheKey));
+  if (subCache.has(cacheKey)) {
+    const cached = subCache.get(cacheKey);
+    if (isAi && BURST_WINDOW_MS > 0) noteBurst(titleKey, cacheKey, Promise.resolve({ vtt: cached }), false);
+    return res.send(cached);
+  }
   const recentFail = failCache.get(cacheKey);
   if (recentFail && recentFail.until > Date.now()) return res.send(recentFail.vtt);
+
+  if (isAi && BURST_WINDOW_MS > 0) {
+    const b = titleBursts.get(titleKey);
+    if (b && b.cacheKey !== cacheKey && (b.running || Date.now() - b.startedAt <= BURST_WINDOW_MS)) {
+      console.log('[AISUBS] Another track of the same title was requested right after the first - serving the first translation instead of paying for a second.');
+      stats.totals.aliased++;
+      try { const { vtt } = await b.promise; return res.send(vtt); } catch (e) { /* first one failed: translate this one itself */ }
+    }
+  }
 
   try {
     let job = inflight.get(cacheKey);
     if (!job) {
       job = generateVtt({ config, candidates, type, id, raw, refUrl });
       inflight.set(cacheKey, job);
-      job.finally(() => inflight.delete(cacheKey)).catch(() => {});
+      const rec = (isAi && BURST_WINDOW_MS > 0) ? noteBurst(titleKey, cacheKey, job, true) : null;
+      job.finally(() => { inflight.delete(cacheKey); if (rec) rec.running = false; }).catch(() => {});
     }
     const { vtt, cacheable } = await job;
     if (cacheable) setInCache(cacheKey, vtt);
@@ -1565,6 +1643,12 @@ async function translateWithGemini(texts, targetLang, apiKey, model, ctx, contex
           ctx.usage.in += um.promptTokenCount || 0;
           ctx.usage.out += um.candidatesTokenCount || 0;
           ctx.usage.think += um.thoughtsTokenCount || 0;
+          if (ctx.usageByModel) {   // billed by the model that actually answered (the fallback chain may switch models)
+            const mu = (ctx.usageByModel[m] = ctx.usageByModel[m] || { in: 0, out: 0, think: 0 });
+            mu.in += um.promptTokenCount || 0;
+            mu.out += um.candidatesTokenCount || 0;
+            mu.think += um.thoughtsTokenCount || 0;
+          }
         }
         const parts = data.candidates?.[0]?.content?.parts || [];
         const reply = parts.filter(p => p.text && !p.thought).map(p => p.text).join('');
