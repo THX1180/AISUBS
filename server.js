@@ -153,9 +153,9 @@ function render(d){
   if(!d.errors.length){er.appendChild(el('div','row ok','No problems recorded.'));}
   d.errors.slice(0,8).forEach(function(e){var r=el('div','row');r.appendChild(el('div','bad',e.text));r.appendChild(el('div','m',ago(d.now-e.at)));er.appendChild(r);});
   $('upd').textContent='Updated '+new Date(d.now).toLocaleTimeString()+' \u00B7 since last restart \u00B7 refreshes every 15s';
-  var used={};d.recent.forEach(function(e){String(e.model).split(' + ').forEach(function(m){used[m]=1;});});
+  var used={};d.recent.forEach(function(e){String(e.model).split(' + ').forEach(function(m){used[m]=1;});});if(d.modelInUse)used[d.modelInUse]=1;
   var pr=Object.keys(used).map(function(m){var p=d.prices[m];return p?m+' $'+p[0]+' in / $'+p[1]+' out':m+' (price not in table, Flash-Lite rate used)';}).join(' \u00B7 ');
-  $('foot').textContent=(t.aliased?t.aliased+' duplicate track requests skipped \u00B7 ':'')+'Server default model '+d.model+' \u00B7 '+d.savedTranslations+' saved translations in memory \u00B7 pace '+d.pacing.minIntervalMs+' ms, '+d.pacing.concurrency+' at a time \u00B7 prices per 1M tokens: '+(pr||'none used yet')+' \u00B7 1 USD = '+fx.eurPerUsd.toFixed(4)+' EUR ('+fx.source+(fx.date?' '+fx.date:'')+')';
+  $('foot').textContent=(t.aliased?t.aliased+' duplicate track requests skipped \u00B7 ':'')+(d.modelInUse?'Model in use '+d.modelInUse+' (from your install page)':'Model in use: not seen yet')+' \u00B7 fallback default '+d.model+' \u00B7 '+d.savedTranslations+' saved translations in memory \u00B7 pace '+d.pacing.minIntervalMs+' ms, '+d.pacing.concurrency+' at a time \u00B7 prices per 1M tokens: '+(pr||'none used yet')+' \u00B7 1 USD = '+fx.eurPerUsd.toFixed(4)+' EUR ('+fx.source+(fx.date?' '+fx.date:'')+')';
 }
 function load(){fetch('status.json',{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(render).catch(function(e){$('upd').textContent='Could not load: '+e.message;});}
 load();setInterval(load,15000);
@@ -746,6 +746,7 @@ app.get(/\/subtitles\//, async (req, res) => {
   if (!/^tt\d+$/.test(imdbId)) return res.json({ subtitles: [] });
 
   const config = parseConfig(profileOrConfig);
+  stats.lastModel = resolveGeminiModel(config.model);
   const L = langHelpers(config);
 
   // All providers in parallel: worst case ~4s total instead of 4 x 3.5s in series.
@@ -1292,6 +1293,7 @@ async function fetchCuesFromCandidates(candidates, type, id, config) {
 // ---- Status page data (kept in memory; resets on restart) -----------------------------------------------------
 const stats = {
   startedAt: Date.now(),
+  lastModel: null,   // model most recently requested by your install (not the server fallback)
   totals: { count: 0, failed: 0, aliased: 0, inTok: 0, outTok: 0, thinkTok: 0, usd: 0, secs: 0 },
   recent: [],    // newest first, max 50
   errors: [],    // newest first, max 20
@@ -1339,6 +1341,7 @@ function statusSnapshot() {
   return {
     now, startedAt: stats.startedAt, uptimeSec: Math.round((now - stats.startedAt) / 1000),
     model: GEMINI_DEFAULT_MODEL,
+    modelInUse: stats.lastModel,
     pacing: { minIntervalMs: GEMINI_MIN_INTERVAL_MS, concurrency: TRANSLATE_CONCURRENCY },
     prices: GEMINI_PRICES,
     fx: { eurPerUsd: fxState.eurPerUsd, date: fxState.date, source: fxState.source },
@@ -1526,6 +1529,7 @@ function noteBurst(titleKey, cacheKey, promise, running) {
 app.get('/sub.vtt', async (req, res) => {
   const { cfg, src, alt, ref, type, id, raw } = req.query;
   const config = parseConfig(cfg);
+  stats.lastModel = resolveGeminiModel(config.model);
   const candidates = [decodeSourceParam(src), decodeSourceParam(alt)].filter(Boolean);
   const refUrl = decodeSourceParam(ref) || null;
 
