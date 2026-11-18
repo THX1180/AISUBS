@@ -1354,16 +1354,35 @@ function statusSnapshot() {
 // Different sources often serve the SAME subtitle (e.g. SubDL mirrors SubSource). Subtitles with identical text,
 // target language and model share one translation, running or finished, so it is only paid for once.
 // USD per 1M tokens [input, output], from Google's published list prices (Nov 2026). Thinking tokens are billed as output.
-// Prices change: set PRICE_IN_PER_M and PRICE_OUT_PER_M in Render to override the table for every model.
+// Prices change: set GEMINI_PRICES_JSON in Render for per-model changes (or PRICE_IN_PER_M + PRICE_OUT_PER_M for one price for all).
 const GEMINI_PRICES = {
   'gemini-3.1-flash-lite': [0.25, 1.5],
   'gemini-3.5-flash-lite': [0.30, 2.5],
   'gemini-3.5-flash': [1.5, 9.0],
   'gemini-3.6-flash': [1.5, 7.5]
 };
+// Per-model overrides from Render: GEMINI_PRICES_JSON = {"gemini-3.6-flash":[1.5,7.5],"some-new-model":[0.4,3]}
+// (each entry is [input, output] in USD per 1M tokens). New model names can be added the same way.
+const PRICE_OVERRIDDEN = new Set();
+try {
+  const extra = JSON.parse(process.env.GEMINI_PRICES_JSON || '{}');
+  for (const [m, p] of Object.entries(extra)) {
+    if (Array.isArray(p) && p.length === 2 && p.every(x => Number.isFinite(Number(x)) && Number(x) >= 0)) {
+      GEMINI_PRICES[m] = [Number(p[0]), Number(p[1])];
+      PRICE_OVERRIDDEN.add(m);
+    } else {
+      console.warn(`[AISUBS] GEMINI_PRICES_JSON: "${m}" must look like [input, output] - ignored.`);
+    }
+  }
+  if (PRICE_OVERRIDDEN.size) console.log('[AISUBS] Price overrides from GEMINI_PRICES_JSON:', [...PRICE_OVERRIDDEN].join(', '));
+} catch (e) {
+  console.warn('[AISUBS] GEMINI_PRICES_JSON is not valid JSON - ignoring it:', e.message);
+}
+
 function priceFor(model) {
+  if (PRICE_OVERRIDDEN.has(model)) return GEMINI_PRICES[model];            // most specific wins
   const envIn = Number(process.env.PRICE_IN_PER_M), envOut = Number(process.env.PRICE_OUT_PER_M);
-  if (envIn > 0 && envOut > 0) return [envIn, envOut];
+  if (envIn > 0 && envOut > 0) return [envIn, envOut];                      // one price for every other model
   return GEMINI_PRICES[model] || GEMINI_PRICES['gemini-3.1-flash-lite'];   // unknown model: assume Flash-Lite rates
 }
 
