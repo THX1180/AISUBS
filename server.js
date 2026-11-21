@@ -102,9 +102,54 @@ function vttToSrt(vtt) {
   return `${out.join('\n\n')}\n`;
 }
 
-app.post('/api/uploads', (req, res) => {
+// Asks Stremio's public Cinemeta what an IMDb id is, so a wrong kind (movie vs series) is caught at upload time.
+async function lookupTitle(tt) {
+  for (const kind of ['series', 'movie']) {
+    try {
+      const r = await fetch(`https://v3-cinemeta.strem.io/meta/${kind}/${tt}.json`, { signal: AbortSignal.timeout(3000) });
+      if (!r.ok) continue;
+      const j = await r.json();
+      if (j?.meta?.name) return { kind, name: String(j.meta.name) };
+    } catch (e) {
+      return null;           // offline or slow: skip the check rather than block the upload
+    }
+  }
+  return null;
+}
+
+// Translates a fresh upload in the background, so it is already done (⚡) when you open the title in Nuvio.
+// It uses the same cache key and in-flight job as the player, so a player asking meanwhile simply joins it.
+async function pretranslateUpload(rec, config) {
+  const url = `upload://${rec.id}`;
+  const id = uploadKey(rec);
+  const cacheKey = vttCacheKey(config, [url], id, undefined);
+  rec.status = 'translating';
+  rec.error = null;
   try {
-    const { name, data, imdb, season, episode, mode } = req.body || {};
+    let job = inflight.get(cacheKey);
+    if (!job) {
+      job = generateVtt({ config, candidates: [url], type: rec.season ? 'series' : 'movie', id, raw: undefined, refUrl: null });
+      inflight.set(cacheKey, job);
+      job.finally(() => inflight.delete(cacheKey)).catch(() => {});
+    }
+    const { vtt, cacheable } = await job;
+    if (cacheable) {
+      setInCache(cacheKey, vtt);
+      rec.status = 'ready';
+      console.log(`[AISUBS] Uploaded subtitle for ${id} is translated and ready.`);
+    } else {
+      rec.status = 'failed';
+      rec.error = ((/Translation failed[^\n]*/.exec(vtt) || [])[0] || 'The translation did not complete (rate limit or an API problem).').slice(0, 200);
+    }
+  } catch (e) {
+    rec.status = 'failed';
+    rec.error = String(e.message || e).slice(0, 200);
+  }
+}
+
+app.post('/api/uploads', async (req, res) => {
+  try {
+    const { name, data, imdb, season, episode, mode, cfg, translateNow } = req.body || {};
     const tt = String(imdb || '').trim().toLowerCase();
     if (!/^tt\d{5,10}$/.test(tt)) return res.status(400).json({ error: 'The IMDb id should look like tt1234567.' });
     const S = season ? Number(season) : null, E = episode ? Number(episode) : null;
@@ -118,6 +163,11 @@ app.post('/api/uploads', (req, res) => {
     if (!bytes.length) return res.status(400).json({ error: 'The file is empty.' });
     if (bytes.length > MAX_UPLOAD_BYTES) return res.status(413).json({ error: 'That file is too large (the limit is 2 MB).' });
 
+    // A wrong season/episode is the usual reason an upload never shows up in the menu, so check what the id really is.
+    const info = await lookupTitle(tt);
+    if (info && info.kind === 'series' && !S) return res.status(400).json({ error: `${info.name} is a series: fill in the season and episode.` });
+    if (info && info.kind === 'movie' && S) return res.status(400).json({ error: `${info.name} is a movie: leave season and episode empty.` });
+
     let cues;
     try {
       cues = parseSubtitleCues(decompressSubtitleBuffer(bytes, S && E ? { season: S, episode: E } : null));
@@ -127,12 +177,22 @@ app.post('/api/uploads', (req, res) => {
     if (!cues || cues.length < 3) return res.status(400).json({ error: 'No subtitle lines were found in that file.' });
 
     const cleanName = String(name || 'subtitle').replace(/[\r\n<>:"|?*\\/]/g, ' ').trim().slice(0, 120) || 'subtitle';
-    const rec = { id: crypto.randomBytes(6).toString('hex'), name: cleanName, imdb: tt, season: S, episode: E, mode, bytes, cues: cues.length, createdAt: Date.now() };
+    const rec = {
+      id: crypto.randomBytes(6).toString('hex'), name: cleanName, title: info ? info.name : null, imdb: tt, season: S, episode: E,
+      mode, bytes, cues: cues.length, createdAt: Date.now(), status: 'manual', error: null
+    };
     for (const [k, u] of uploads) if (uploadKey(u) === uploadKey(rec) && u.mode === mode) uploads.delete(k);   // newer replaces older
     uploads.set(rec.id, rec);
     while (uploads.size > MAX_UPLOADS) uploads.delete(uploads.keys().next().value);
-    console.log(`[AISUBS] Subtitle uploaded for ${uploadKey(rec)} (${mode}, ${cues.length} lines).`);
-    res.json({ id: rec.id, name: rec.name, cues: rec.cues });
+    console.log(`[AISUBS] Subtitle uploaded for ${uploadKey(rec)}${rec.title ? ` (${rec.title})` : ''}: ${mode}, ${cues.length} lines.`);
+
+    if (mode === 'native') {
+      rec.status = 'ready';                                           // used as it is: nothing to translate
+    } else if (translateNow !== false) {
+      const config = parseConfig(String(cfg || ''));
+      if ((config.apiKey || ENV_GEMINI_KEY) && config.provider !== 'free') pretranslateUpload(rec, config);   // runs in the background
+    }
+    res.json({ id: rec.id, name: rec.name, title: rec.title, cues: rec.cues, status: rec.status });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -141,7 +201,7 @@ app.post('/api/uploads', (req, res) => {
 app.get('/api/uploads', (req, res) => {
   res.json({
     uploads: [...uploads.values()].reverse().map(u => ({
-      id: u.id, name: u.name, imdb: u.imdb, season: u.season, episode: u.episode, mode: u.mode, cues: u.cues, size: u.bytes.length, createdAt: u.createdAt
+      id: u.id, name: u.name, title: u.title, imdb: u.imdb, season: u.season, episode: u.episode, mode: u.mode, cues: u.cues, size: u.bytes.length, createdAt: u.createdAt, status: u.status, error: u.error
     }))
   });
 });
@@ -841,7 +901,7 @@ async function fromSubSource(config, imdbId, season, episode, filename, L) {
 }
 
 // ✅ = made for your exact file (hash match). 🟡 = release name matches your file. ⚠️ = no match info (timing unverified).
-const matchMarker = (c) => c.pinned ? '📁' : (c.isHashMatch || c.sync?.state === 'verified' || c.sync?.state === 'corrected')
+const matchMarker = (c) => c.pinned ? '📂' : (c.isHashMatch || c.sync?.state === 'verified' || c.sync?.state === 'corrected')
   ? '✅' : (c.score >= 200 ? '🟡' : '⚠️');
 
 function buildSubtitleTracks({ rankedEn, rankedTarget, targetName, iso3, mkUrl }) {
@@ -856,7 +916,7 @@ function buildSubtitleTracks({ rankedEn, rankedTarget, targetName, iso3, mkUrl }
   };
   // Up to 4 English sources (one per source), each its own "translate this one" choice (the best also gets the runner-up as backup).
   rankedEn.slice(0, 4).forEach((c, i) => {
-    add(`${matchMarker(c)}${c.ready ? ' ⚡' : ''} AI translation from ${c.pinned ? 'your upload' : 'English'} · ${c.release}`, c.source, mkUrl(c, (i === 0 && !c.pinned) ? rankedEn[1] : null, false));
+    add(`${matchMarker(c)}${c.ready ? (c.pinned ? '⚡' : ' ⚡') : ''} AI translation from ${c.pinned ? 'your upload' : 'English'} · ${c.release}`, c.source, mkUrl(c, (i === 0 && !c.pinned) ? rankedEn[1] : null, false));
   });
   // Up to 4 ready-made subtitles in your language: instant, no AI cost.
   rankedTarget.slice(0, 4).forEach(c => {
@@ -914,7 +974,7 @@ app.get(/\/subtitles\//, async (req, res) => {
   for (const up of uploadsFor(fullId)) {
     candidateSubs.push({
       source: 'Upload', release: up.name, isHashMatch: false, isEmbedded: false, machine: false,
-      score: 0, pinned: true, lang: up.mode === 'native' ? L.iso3 : 'eng', url: `upload://${up.id}`
+      score: 0, pinned: true, ready: up.status === 'ready' && up.mode === 'translate', lang: up.mode === 'native' ? L.iso3 : 'eng', url: `upload://${up.id}`
     });
   }
 
@@ -927,7 +987,7 @@ app.get(/\/subtitles\//, async (req, res) => {
   // Remember what we know: sync results from earlier plays, and which translations are already saved (ready).
   candidateSubs.forEach(c => {
     c.sync = syncStatus.get(c.url) || null;
-    c.ready = subCache.has(vttCacheKey(config, [c.url], fullId, undefined));
+    c.ready = !!c.ready || subCache.has(vttCacheKey(config, [c.url], fullId, undefined));
   });
   // Reference for timing checks: the file made for your exact video, else a very close release match.
   const refPool = candidateSubs.filter(c => !c.machine && !c.pinned);
@@ -963,7 +1023,8 @@ app.get(/\/subtitles\//, async (req, res) => {
     rankedEn, rankedTarget, targetName: config.langName || 'Dutch', iso3: L.iso3, mkUrl
   });
 
-  return res.json({ subtitles: out });
+  if (uploadsFor(fullId).length) console.log(`[AISUBS] Menu for ${fullId}: ${uploadsFor(fullId).length} uploaded subtitle(s) pinned on top.`);
+  return res.json({ subtitles: out, cacheMaxAge: 10 });
 });
 
 // ----------------------------------------------------

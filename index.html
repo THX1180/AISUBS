@@ -283,6 +283,16 @@
           </select>
         </div>
       </div>
+      <div class="form-group checkbox-group" id="upNowRow">
+        <label class="custom-switch">
+          <input type="checkbox" id="upNow" checked>
+          <span class="slider"></span>
+        </label>
+        <div class="switch-meta">
+          <span class="switch-title">Translate right away</span>
+          <span class="helper">Starts translating in the background, so it is ready (📂⚡) when you open the title in Nuvio. Uses your AI key, about 1 to 3 cents.</span>
+        </div>
+      </div>
       <div class="actions" style="margin-top:1rem;">
         <button type="button" id="upBtn" class="btn btn-primary">⬆ Upload</button>
       </div>
@@ -743,7 +753,9 @@
       const upFile = document.getElementById('upFile'), upImdb = document.getElementById('upImdb');
       const upSeason = document.getElementById('upSeason'), upEpisode = document.getElementById('upEpisode');
       const upMode = document.getElementById('upMode'), upBtn = document.getElementById('upBtn');
+      const upNow = document.getElementById('upNow'), upNowRow = document.getElementById('upNowRow');
       const upStatus = document.getElementById('upStatus'), upList = document.getElementById('upList');
+      let pollTimer = null;
 
       function msg(text, bad) { upStatus.textContent = text; upStatus.style.color = bad ? 'var(--err)' : 'var(--muted)'; }
       function fileToBase64(file) {
@@ -764,23 +776,39 @@
         if (!res.ok) throw new Error(data.error || ('Server said HTTP ' + res.status));
         return data;
       }
+      upMode.addEventListener('change', function () { upNowRow.style.display = upMode.value === 'translate' ? '' : 'none'; });
+
+      function statusLine(u) {
+        if (u.mode === 'native') return ['\uD83D\uDCC2 Ready: used as it is, at the top of the list in Nuvio.', ''];
+        if (u.status === 'translating') return ['\u23F3 Translating in the background...', ''];
+        if (u.status === 'ready') return ['\uD83D\uDCC2\u26A1 Translated and ready: at the top of the list in Nuvio.', 'ok'];
+        if (u.status === 'failed') return ['\u274C ' + (u.error || 'The translation failed.') + ' It will try again when you play it in Nuvio.', 'bad'];
+        return ['At the top of the list in Nuvio (\uD83D\uDCC2). It translates when you play it.', ''];
+      }
 
       async function refresh() {
+        clearTimeout(pollTimer);
         let data;
         try { data = await api('/api/uploads'); }
         catch (e) { upList.textContent = ''; msg('Open this page from your /k-YOURTOKEN address to use uploads.', true); return; }
         upList.textContent = '';
+        let busy = false;
         data.uploads.forEach(function (u) {
           const row = document.createElement('div'); row.className = 'up-item';
-          const nm = document.createElement('div'); nm.className = 'up-name'; nm.textContent = u.name; row.appendChild(nm);
+          const nm = document.createElement('div'); nm.className = 'up-name'; nm.textContent = (u.title ? u.title + ' \u00B7 ' : '') + u.name; row.appendChild(nm);
           const meta = document.createElement('div'); meta.className = 'up-meta';
           meta.textContent = u.imdb + (u.season ? ' S' + String(u.season).padStart(2, '0') + 'E' + String(u.episode).padStart(2, '0') : ' (movie)')
             + ' \u00B7 ' + (u.mode === 'translate' ? 'to be translated' : 'used as it is') + ' \u00B7 ' + u.cues + ' lines';
           row.appendChild(meta);
+          const sl = statusLine(u);
+          const st = document.createElement('div'); st.className = 'up-meta'; st.textContent = sl[0];
+          if (sl[1] === 'ok') st.style.color = 'var(--ok)'; if (sl[1] === 'bad') st.style.color = 'var(--err)';
+          row.appendChild(st);
+          if (u.status === 'translating') busy = true;
           const act = document.createElement('div'); act.className = 'up-actions';
           if (u.mode === 'translate') {
             const dl = document.createElement('button'); dl.type = 'button'; dl.className = 'btn btn-secondary btn-sm';
-            dl.textContent = '\u2B07 Translate & download .srt';
+            dl.textContent = '\u2B07 Download translated .srt';
             dl.addEventListener('click', function () { translateAndDownload(u, dl); });
             act.appendChild(dl);
           }
@@ -794,11 +822,12 @@
           row.appendChild(act);
           upList.appendChild(row);
         });
+        if (busy) pollTimer = setTimeout(refresh, 4000);          // keep checking while something is translating
       }
 
       async function translateAndDownload(u, btn) {
         btn.disabled = true;
-        msg('Translating... this can take up to 2 minutes for a long episode. Keep this page open.');
+        msg('Preparing the file... this can take up to 2 minutes for a long episode (instant if it is already translated). Keep this page open.');
         try {
           const data = await api('/api/uploads/' + encodeURIComponent(u.id) + '/translate', {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cfg: configB64() })
@@ -825,9 +854,11 @@
           const data = await fileToBase64(file);
           const r = await api('/api/uploads', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: file.name, data: data, imdb: upImdb.value.trim(), season: s, episode: e, mode: upMode.value })
+            body: JSON.stringify({ name: file.name, data: data, imdb: upImdb.value.trim(), season: s, episode: e, mode: upMode.value,
+              cfg: configB64(), translateNow: upNow.checked })
           });
-          msg('Uploaded (' + r.cues + ' lines). Open the title in Nuvio and look for the \uD83D\uDCC1 entry at the top.');
+          const what = r.title ? r.title + (s ? ' S' + s.padStart(2, '0') + 'E' + e.padStart(2, '0') : '') : upImdb.value.trim();
+          msg('Uploaded for ' + what + ' (' + r.cues + ' lines). ' + (r.status === 'translating' ? 'Translating now. It will be at the top of the list in Nuvio as \uD83D\uDCC2\u26A1 when done.' : 'Look for the \uD83D\uDCC2 entry at the top of the list in Nuvio.'));
           upFile.value = '';
           refresh();
         } catch (err) { msg(err.message, true); }
