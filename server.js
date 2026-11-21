@@ -80,6 +80,96 @@ app.get(['/', '/index.html', '/configure', '/:config/configure', '/p/:profile/co
   (req, res) => res.sendFile(path.join(ROOT, 'index.html')));
 app.get('/health', (req, res) => res.send('ok'));
 
+// ---- Uploaded subtitles (memory only: the newest 20 are kept until the server restarts) ---------------------
+const uploads = new Map();   // id -> { id, name, imdb, season, episode, mode, bytes, cues, createdAt }
+const MAX_UPLOADS = 20;
+const MAX_UPLOAD_BYTES = 2 * 1024 * 1024;
+const uploadKey = (u) => (u.season ? `${u.imdb}:${u.season}:${u.episode}` : u.imdb);
+const uploadsFor = (fullId) => [...uploads.values()].filter(u => uploadKey(u) === String(fullId).toLowerCase()).sort((a, b) => b.createdAt - a.createdAt);
+
+function vttToSrt(vtt) {
+  const out = [];
+  let n = 1;
+  for (const block of String(vtt).replace(/\r/g, '').split(/\n\n+/)) {
+    const lines = block.split('\n').filter(l => l.length);
+    const ti = lines.findIndex(l => l.includes('-->'));
+    if (ti < 0) continue;
+    const [from, to] = lines[ti].split('-->').map(x => x.trim().split(' ')[0].replace('.', ','));
+    const text = lines.slice(ti + 1).join('\n').replace(/<[^>]+>/g, '');
+    if (!text.trim()) continue;
+    out.push(`${n++}\n${from} --> ${to}\n${text}`);
+  }
+  return `${out.join('\n\n')}\n`;
+}
+
+app.post('/api/uploads', (req, res) => {
+  try {
+    const { name, data, imdb, season, episode, mode } = req.body || {};
+    const tt = String(imdb || '').trim().toLowerCase();
+    if (!/^tt\d{5,10}$/.test(tt)) return res.status(400).json({ error: 'The IMDb id should look like tt1234567.' });
+    const S = season ? Number(season) : null, E = episode ? Number(episode) : null;
+    if (!!S !== !!E) return res.status(400).json({ error: 'Fill in both season and episode for a series, or leave both empty for a movie.' });
+    if (S && (!Number.isInteger(S) || S < 1 || S > 99 || !Number.isInteger(E) || E < 1 || E > 999)) {
+      return res.status(400).json({ error: 'Season and episode must be whole numbers.' });
+    }
+    if (!['translate', 'native'].includes(mode)) return res.status(400).json({ error: 'Choose what kind of file this is.' });
+
+    const bytes = Buffer.from(String(data || ''), 'base64');
+    if (!bytes.length) return res.status(400).json({ error: 'The file is empty.' });
+    if (bytes.length > MAX_UPLOAD_BYTES) return res.status(413).json({ error: 'That file is too large (the limit is 2 MB).' });
+
+    let cues;
+    try {
+      cues = parseSubtitleCues(decompressSubtitleBuffer(bytes, S && E ? { season: S, episode: E } : null));
+    } catch (e) {
+      return res.status(400).json({ error: `Could not read that file: ${e.message}` });
+    }
+    if (!cues || cues.length < 3) return res.status(400).json({ error: 'No subtitle lines were found in that file.' });
+
+    const cleanName = String(name || 'subtitle').replace(/[\r\n<>:"|?*\\/]/g, ' ').trim().slice(0, 120) || 'subtitle';
+    const rec = { id: crypto.randomBytes(6).toString('hex'), name: cleanName, imdb: tt, season: S, episode: E, mode, bytes, cues: cues.length, createdAt: Date.now() };
+    for (const [k, u] of uploads) if (uploadKey(u) === uploadKey(rec) && u.mode === mode) uploads.delete(k);   // newer replaces older
+    uploads.set(rec.id, rec);
+    while (uploads.size > MAX_UPLOADS) uploads.delete(uploads.keys().next().value);
+    console.log(`[AISUBS] Subtitle uploaded for ${uploadKey(rec)} (${mode}, ${cues.length} lines).`);
+    res.json({ id: rec.id, name: rec.name, cues: rec.cues });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/uploads', (req, res) => {
+  res.json({
+    uploads: [...uploads.values()].reverse().map(u => ({
+      id: u.id, name: u.name, imdb: u.imdb, season: u.season, episode: u.episode, mode: u.mode, cues: u.cues, size: u.bytes.length, createdAt: u.createdAt
+    }))
+  });
+});
+
+app.delete('/api/uploads/:id', (req, res) => {
+  res.json({ deleted: uploads.delete(req.params.id) });
+});
+
+// Translate an upload now and hand back an .srt to keep (costs the same as translating it in Nuvio).
+app.post('/api/uploads/:id/translate', async (req, res) => {
+  const u = uploads.get(req.params.id);
+  if (!u) return res.status(404).json({ error: 'That upload is no longer on the server (a restart clears them). Upload it again.' });
+  if (u.mode !== 'translate') return res.status(400).json({ error: 'This file is already in your language, so there is nothing to translate.' });
+  const config = parseConfig(String(req.body?.cfg || ''));
+  try {
+    const result = await generateVtt({
+      config, candidates: [`upload://${u.id}`], type: u.season ? 'series' : 'movie', id: uploadKey(u), raw: undefined, refUrl: null, noBanner: true
+    });
+    if (!result.cacheable) {
+      return res.status(502).json({ error: 'The translation did not complete (rate limit or an API problem). Check the status page, then try again.' });
+    }
+    const srt = vttToSrt(result.vtt);
+    res.json({ filename: `${u.name.replace(/\.[^.]+$/, '')}.${config.lang || 'nld'}.srt`, srt, cues: result.cues, missed: result.missed || 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Status page: not in PUBLIC_PATHS, so it needs the /k-TOKEN address whenever ACCESS_TOKEN is set.
 const STATUS_HTML = String.raw`<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -111,6 +201,7 @@ h2{font-size:1rem;margin:1.3rem 0 .5rem}
 <header><img src="/logo.png" alt=""><div><h1>AISUBS status</h1><div class="sub" id="upd">loading...</div></div><button class="cur" id="cur" type="button">Show in \u20AC</button></header>
 <div class="grid" id="cards"></div>
 <h2>OpenSubtitles</h2><div class="box" id="os"></div>
+<h2>Saved subtitles (Upstash)</h2><div class="box" id="store"></div>
 <h2>Recent translations</h2><div class="box" id="recent"></div>
 <h2>Recent problems</h2><div class="box" id="errs"></div>
 <p class="sub" style="margin-top:1.2rem" id="foot"></p>
@@ -138,9 +229,19 @@ function render(d){
   var os=$('os');os.textContent='';var o=d.openSubtitles;
   kv(os,'Login',o.loginAt?'OK ('+o.user+')':(o.lastLoginError?'failed':'not used yet'),o.loginAt?'ok':(o.lastLoginError?'bad':'muted'));
   if(o.allowance!==null)kv(os,'Daily allowance',String(o.allowance)+(o.vip?' (VIP)':''));
-  if(o.remaining!==null)kv(os,'Downloads left',String(o.remaining));
+  if(o.remaining!==null)kv(os,'Downloads left',String(o.remaining)+(o.remainingEstimated?' (estimated, daily reset at 00:00 UTC)':(o.remainingAt?' (checked '+ago(d.now-o.remainingAt)+')':'')));
   if(o.lastLoginError)kv(os,'Last login error',o.lastLoginError,'bad');
   kv(os,'Quota',o.quotaUsedUntil?'used up - hidden until 00:00 UTC':'available',o.quotaUsedUntil?'bad':'ok');
+  var stg=$('store');stg.textContent='';var sg=d.storage||{};
+  if(!sg.configured){kv(stg,'Status','not set up (memory only)','muted');}
+  else{
+    var bad=sg.pausedNow||sg.pingOk===false;
+    kv(stg,'Status',sg.pausedNow?'problem - paused for a moment':(sg.pingOk===false?'cannot connect':'connected'),bad?'bad':'ok');
+    kv(stg,'Saved this session',String(sg.saves));
+    kv(stg,'Loaded from storage',String(sg.hits));
+    kv(stg,'Kept for',sg.ttlDays+' days');
+    if(sg.lastError)kv(stg,'Last problem',sg.lastError,'bad');
+  }
   var rc=$('recent');rc.textContent='';
   if(!d.recent.length){rc.appendChild(el('div','row muted','Nothing translated since the last restart.'));}
   d.recent.slice(0,10).forEach(function(e){
@@ -160,7 +261,15 @@ function render(d){
 function load(){fetch('status.json',{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(render).catch(function(e){$('upd').textContent='Could not load: '+e.message;});}
 load();setInterval(load,15000);
 </script></body></html>`;
-app.get('/status.json', async (req, res) => { res.setHeader('Cache-Control', 'no-store'); await refreshFx(); res.json(statusSnapshot()); });
+app.get('/status.json', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  await Promise.all([refreshFx(), refreshOsQuota()]);
+  if (UPSTASH_ON && Date.now() - upstashState.lastPingAt > 5 * 60 * 1000) {   // re-check the connection every 5 minutes
+    upstashState.lastPingAt = Date.now();
+    upstashState.pingOk = !!(await upstashCall('', ['PING']));
+  }
+  res.json(statusSnapshot());
+});
 app.get('/status', (req, res) => { res.setHeader('Cache-Control', 'no-store'); res.type('html').send(STATUS_HTML); });
 app.get('/style.css', (req, res) => res.sendFile(path.join(ROOT, 'style.css')));
 app.get('/logo.png', (req, res) => res.sendFile(path.join(ROOT, 'logo.png')));
@@ -268,7 +377,7 @@ function decodeSourceParam(param) {
   if (!param) return '';
   try {
     const decoded = Buffer.from(param, 'base64url').toString('utf-8');
-    if (decoded.startsWith('http') || decoded.startsWith('os://') || decoded.startsWith('subsource://')) return decoded;
+    if (decoded.startsWith('http') || decoded.startsWith('os://') || decoded.startsWith('subsource://') || decoded.startsWith('upload://')) return decoded;
   } catch {}
   return param;
 }
@@ -276,21 +385,42 @@ function decodeSourceParam(param) {
 // ----------------------------------------------------
 // Scene Release Matching & Scoring Algorithm
 // ----------------------------------------------------
+// Release group = the text after the last "-" of the file name, e.g. "...H.264-EDITH[EZTVx.to].mkv" -> "edith".
+// (A fixed list of groups can never keep up, so the group is read from the name itself.)
+const GENERIC_TAIL = new Set(['dl', 'rip', 'web', 'webdl', 'webrip', 'hdtv', 'hdrip', 'bdrip', 'brrip', 'dvdrip', 'bluray', 'remux', 'hdr', 'dv',
+  'atmos', 'aac', 'ac3', 'dts', 'ddp5', 'h264', 'h265', 'x264', 'x265', 'hevc', 'avc', 'av1', 'mkv', 'mp4', 'srt', 'sub', 'subs', 'eng', 'en', 'nl']);
+function releaseGroupOf(name) {
+  let n = String(name || '');
+  const ext = n.search(/\.(mkv|mp4|avi|ts|m4v|srt|vtt|ass|ssa|zip)(?![a-z0-9])/i);
+  if (ext >= 0) n = n.slice(0, ext);                              // drop anything after the extension (" H265 🇬🇧")
+  n = n.replace(/\[[^\]]*\]|\([^)]*\)/g, ' ').trim();             // drop [EZTVx.to] and (tags)
+  const m = /-\s*([a-z0-9]+)(?:[. ][a-z0-9]+)*\s*$/i.exec(n);
+  const g = m ? m[1].toLowerCase() : '';
+  return (g.length >= 3 && !GENERIC_TAIL.has(g) && !/^\d+p$/.test(g)) ? g : '';
+}
+
 function scoreSubtitleMatch(subReleaseName, videoFilename, isHashMatch = false) {
   if (isHashMatch) return 1000;
 
   let score = 0;
-  const subClean = (subReleaseName || '').toLowerCase().replace(/[\.\-\_]/g, ' ');
-  const vidClean = (videoFilename || '').toLowerCase().replace(/[\.\-\_]/g, ' ');
+  const clean = (x) => String(x || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  const subClean = clean(subReleaseName);
+  const vidClean = clean(videoFilename);
+
+  // Same release group as your video (read from the names, so any group works).
+  const vidGroup = releaseGroupOf(videoFilename);
+  let countedGroup = '';
+  if (vidGroup && new Set(subClean.split(' ')).has(vidGroup)) { score += 200; countedGroup = vidGroup; }
 
   const groups = ['flux', 'ntb', 'yify', 'yts', 'rarbg', 'psa', 'ion10', 'galaxyrg', 'cmrg', 'sparks', 'geckos', 'glhf', 'deflate', 'amzn', 'nf', 'atvp', 'dnp', 'qxr', 'swag'];
   for (const g of groups) {
+    if (g === countedGroup) continue;
     if (vidClean.includes(g) && subClean.includes(g)) score += 200;
   }
 
   const sources = ['web-dl', 'webdl', 'webrip', 'web', 'bluray', 'bdrip', 'brrip', 'hdtv', 'dvdrip', 'remux'];
-  for (const s of sources) {
-    if (vidClean.includes(s) && subClean.includes(s)) score += 120;
+  for (const src of sources) {
+    if (vidClean.includes(src) && subClean.includes(src)) score += 120;
   }
 
   const res = ['2160p', '4k', '1080p', '720p', '480p'];
@@ -628,6 +758,21 @@ async function subsourceFindTitle(headers, imdbId, season) {
   return id || null;
 }
 
+// Season marks in a release name: "S02", "Season 2", ranges like "S01-S04". Returns true when the name clearly points at
+// other seasons only (no mark = unknown = not a mismatch).
+function packSeasonMismatch(names, season) {
+  const want = Number(season);
+  let sawMark = false;
+  for (const n of names) {
+    const range = /s0*(\d{1,2})\s*(?:-|~|to)\s*s?0*(\d{1,2})/i.exec(n);
+    if (range) { sawMark = true; if (want >= Number(range[1]) && want <= Number(range[2])) return false; continue; }
+    const marks = [...String(n).matchAll(/(?:^|[^a-z0-9])s0*(\d{1,2})(?![0-9]|[ ._-]?e\d)/gi)].map(m => Number(m[1]))
+      .concat([...String(n).matchAll(/season[ ._-]*0*(\d{1,2})/gi)].map(m => Number(m[1])));
+    if (marks.length) { sawMark = true; if (marks.includes(want)) return false; }
+  }
+  return sawMark;
+}
+
 async function fromSubSource(config, imdbId, season, episode, filename, L) {
   const headers = { 'X-API-Key': config.subsourceApiKey.trim(), 'User-Agent': 'AISUBS/2.6', Accept: 'application/json' };
 
@@ -669,6 +814,7 @@ async function fromSubSource(config, imdbId, season, episode, filename, L) {
         const exact = !epRe || names.some(n => epRe.test(n));
         const packLike = !!epRe && !exact && !names.some(n => EPISODE_MARK_RE.test(n));
         if (epRe && !exact && !packLike) { dropped.otherEpisode++; return []; }
+        if (epRe && packLike && packSeasonMismatch(names, season)) { dropped.otherEpisode++; return []; }   // another season's pack
         const pack = packLike && Number(it.files) > 1;
         const hi = isTrue(it.hearingImpaired);
         return [{
@@ -695,7 +841,7 @@ async function fromSubSource(config, imdbId, season, episode, filename, L) {
 }
 
 // ✅ = made for your exact file (hash match). 🟡 = release name matches your file. ⚠️ = no match info (timing unverified).
-const matchMarker = (c) => (c.isHashMatch || c.sync?.state === 'verified' || c.sync?.state === 'corrected')
+const matchMarker = (c) => c.pinned ? '📁' : (c.isHashMatch || c.sync?.state === 'verified' || c.sync?.state === 'corrected')
   ? '✅' : (c.score >= 200 ? '🟡' : '⚠️');
 
 function buildSubtitleTracks({ rankedEn, rankedTarget, targetName, iso3, mkUrl }) {
@@ -710,11 +856,11 @@ function buildSubtitleTracks({ rankedEn, rankedTarget, targetName, iso3, mkUrl }
   };
   // Up to 4 English sources (one per source), each its own "translate this one" choice (the best also gets the runner-up as backup).
   rankedEn.slice(0, 4).forEach((c, i) => {
-    add(`${matchMarker(c)}${c.ready ? ' ⚡' : ''} AI translation from English · ${c.release}`, c.source, mkUrl(c, i === 0 ? rankedEn[1] : null, false));
+    add(`${matchMarker(c)}${c.ready ? ' ⚡' : ''} AI translation from ${c.pinned ? 'your upload' : 'English'} · ${c.release}`, c.source, mkUrl(c, (i === 0 && !c.pinned) ? rankedEn[1] : null, false));
   });
   // Up to 4 ready-made subtitles in your language: instant, no AI cost.
   rankedTarget.slice(0, 4).forEach(c => {
-    const kind = c.machineKind === 'ai' ? 'AI translation' : (c.machine ? 'Machine translation' : `${targetName} (native)`);
+    const kind = c.pinned ? `${targetName} (your upload)` : c.machineKind === 'ai' ? 'AI translation' : (c.machine ? 'Machine translation' : `${targetName} (native)`);
     add(`${matchMarker(c)} ${kind} · ${c.release}`, c.source, mkUrl(c, null, true));
   });
   return tracks;
@@ -764,8 +910,17 @@ app.get(/\/subtitles\//, async (req, res) => {
   if (Date.now() < osQuotaUntil) candidateSubs = candidateSubs.filter(c => !String(c.url).startsWith('os://'));
   console.log('[AISUBS] candidates by source:', JSON.stringify(candidateSubs.reduce((m, c) => (m[c.source] = (m[c.source] || 0) + 1, m), {})));
 
+  // Subtitles you uploaded for exactly this title (pinned to the top of the menu).
+  for (const up of uploadsFor(fullId)) {
+    candidateSubs.push({
+      source: 'Upload', release: up.name, isHashMatch: false, isEmbedded: false, machine: false,
+      score: 0, pinned: true, lang: up.mode === 'native' ? L.iso3 : 'eng', url: `upload://${up.id}`
+    });
+  }
+
   // Exact-file matches first, then human-made before machine-made, then release-name score.
   const byQuality = (x, y) =>
+    (Number(!!y.pinned) - Number(!!x.pinned)) ||                 // your uploads first
     (Number(!!y.isHashMatch) - Number(!!x.isHashMatch)) ||
     (Number(!!x.machine) - Number(!!y.machine)) ||
     (y.score - x.score);
@@ -775,7 +930,7 @@ app.get(/\/subtitles\//, async (req, res) => {
     c.ready = subCache.has(vttCacheKey(config, [c.url], fullId, undefined));
   });
   // Reference for timing checks: the file made for your exact video, else a very close release match.
-  const refPool = candidateSubs.filter(c => !c.machine);
+  const refPool = candidateSubs.filter(c => !c.machine && !c.pinned);
   const refCand = refPool.filter(c => c.isHashMatch).sort(byQuality)[0]
     || refPool.filter(c => c.score >= STRONG_RELEASE_SCORE).sort(byQuality)[0] || null;
 
@@ -787,6 +942,13 @@ app.get(/\/subtitles\//, async (req, res) => {
     return picked.sort(byQuality);
   };
   const rankedEn = diversify(candidateSubs.filter(c => L.isEnglish(c.lang)).sort(byQuality), 4);
+  if (UPSTASH_ON) {                           // ⚡ for tracks that are saved in Upstash (e.g. translated before a restart)
+    const todo = rankedEn.filter(c => !c.ready && !c.pinned);
+    if (todo.length) {
+      const flags = await upstashReadyFlags(todo.map(c => vttCacheKey(config, [c.url], fullId, undefined)));
+      todo.forEach((c, i) => { if (flags[i]) c.ready = true; });
+    }
+  }
   const rankedTarget = candidateSubs.filter(c => L.isTarget(c.lang)).sort(byQuality);
 
   const base = publicBase(req) + (req.tokenPrefix || '');
@@ -794,7 +956,8 @@ app.get(/\/subtitles\//, async (req, res) => {
   const mkUrl = (c, alt, raw) =>
     `${base}/sub.vtt?cfg=${cfg}&type=${mediaType}&id=${encodeURIComponent(fullId)}&src=${encodeSourceParam(c.url)}` +
     `${alt ? `&alt=${encodeSourceParam(alt.url)}` : ''}${raw ? '&raw=true' : ''}` +
-    `${refCand && refCand.url !== c.url ? `&ref=${encodeSourceParam(refCand.url)}` : ''}`;
+    `${refCand && refCand.url !== c.url && !c.pinned ? `&ref=${encodeSourceParam(refCand.url)}` : ''}` +
+    `${filename ? `&fn=${encodeURIComponent(String(filename).slice(0, 200))}` : ''}`;
 
   const out = buildSubtitleTracks({
     rankedEn, rankedTarget, targetName: config.langName || 'Dutch', iso3: L.iso3, mkUrl
@@ -810,10 +973,40 @@ app.get(/\/subtitles\//, async (req, res) => {
 // Without a login the API allows only a handful of downloads a day. With the account details from the page, the
 // server signs in once (token kept ~20h in memory) and sends it with every download.
 const osTokens = new Map();    // username -> { token, base, until }
+let osLastAuth = null;         // the most recent login, so the status page can check the live quota (never shown anywhere)
+
+// Asks OpenSubtitles how many downloads are left today (it also counts downloads made elsewhere with this account).
+// Best effort: if it fails, the page falls back to an estimate that knows about the daily reset.
+async function refreshOsQuota() {
+  const a = osLastAuth;
+  if (!a || a.until < Date.now()) return;
+  if (Date.now() - stats.os.lastQuotaCheck < 3 * 60 * 1000) return;     // at most every 3 minutes
+  stats.os.lastQuotaCheck = Date.now();
+  try {
+    const r = await fetch(`${a.base}/api/v1/infos/user`, {
+      headers: { 'Api-Key': a.apiKey, Authorization: `Bearer ${a.token}`, 'User-Agent': 'AISUBS v2.5.0', Accept: 'application/json' },
+      signal: AbortSignal.timeout(4000)
+    });
+    if (r.status === 401) { osTokens.delete(a.user); osLastAuth = null; return; }     // expired login: a new one is made on the next download
+    const j = await r.json().catch(() => ({}));
+    const d = j?.data ?? j;
+    const left = Number(d?.remaining_downloads);
+    if (!r.ok || !Number.isFinite(left)) throw new Error(`HTTP ${r.status}, no remaining_downloads in the reply`);
+    stats.os.remaining = left;
+    stats.os.remainingAt = Date.now();
+    stats.os.lookupOk = true;
+    if (Number.isFinite(Number(d.allowed_downloads))) stats.os.allowance = Number(d.allowed_downloads);
+    if (left > 0) osQuotaUntil = 0;                                        // never keep hiding tracks on a stale "used up"
+    else if (osQuotaUntil <= Date.now()) markOsQuotaUsed();
+  } catch (e) {
+    if (stats.os.lookupOk !== false) console.warn('[AISUBS] OpenSubtitles live quota check not available:', e.message, '- using an estimate.');
+    stats.os.lookupOk = false;
+  }
+}
 let osQuotaUntil = 0;          // while now < this, OpenSubtitles downloads are known to be used up (until 00:00 UTC)
 
 function markOsQuotaUsed() {
-  const d = new Date();
+  const d = new Date(Date.now());
   osQuotaUntil = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
   console.log('[AISUBS] OpenSubtitles daily downloads used up - hiding its tracks until 00:00 UTC.');
   recordError('OpenSubtitles daily downloads used up - its tracks are hidden until 00:00 UTC.');
@@ -839,6 +1032,7 @@ async function getOsAuth(config) {
     }
     const entry = { token: j.token, base: j.base_url ? `https://${j.base_url}` : 'https://api.opensubtitles.com', until: Date.now() + 20 * 3600 * 1000 };
     osTokens.set(config.osUsername, entry);
+    osLastAuth = { token: entry.token, base: entry.base, apiKey: config.osApiKey, until: entry.until, user: config.osUsername };
     console.log(`[AISUBS] OpenSubtitles login OK (${config.osUsername}): daily allowance ${j.user?.allowed_downloads ?? '?'}${j.user?.vip ? ', VIP' : ''}.`);
     Object.assign(stats.os, { user: config.osUsername, allowance: j.user?.allowed_downloads ?? null, vip: !!j.user?.vip, loginAt: Date.now(), lastLoginError: null });
     return entry;
@@ -857,6 +1051,13 @@ async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId, c
   for (let rawUrl of candidateUrls) {
     if (!rawUrl) continue;
     let targetUrl = rawUrl;
+
+    if (targetUrl.startsWith('upload://')) {            // your own uploaded file: no network involved
+      const up = uploads.get(targetUrl.slice(9));
+      if (up) return { buffer: up.bytes, finalUrl: targetUrl };
+      lastError = new Error('The uploaded file is no longer on the server');
+      continue;
+    }
 
     if (targetUrl.startsWith('os://')) {
       try {
@@ -885,6 +1086,7 @@ async function downloadSubtitleWithFallbacks(candidateUrls, mediaType, fullId, c
         if (dlJson.remaining !== undefined) {
           console.log(`[AISUBS] OpenSubtitles downloads left today: ${dlJson.remaining}${auth ? '' : ' (no login sent)'}`);
           stats.os.remaining = dlJson.remaining;
+          stats.os.remainingAt = Date.now();
         }
         targetUrl = dlJson.link;
       } catch (e) {
@@ -975,6 +1177,57 @@ function episodeRegex(season, episode) {
 }
 const EPISODE_MARK_RE = /s\d{1,2}[ ._-]?e\d{1,3}|(?:^|[^\d])\d{1,2}x\d{1,3}(?!\d)|(?:episode|ep)[ ._-]?\d/i;
 const SUB_EXT_RE = /\.(srt|vtt|ass|ssa|sub)$/i;
+const withFilename = (ep, filename) => (ep ? { ...ep, filename: filename || '' } : null);
+
+const QUALITY_WORDS = new Set(['1080p', '720p', '2160p', '480p', '4k', 'web', 'dl', 'webdl', 'webrip', 'bluray', 'bdrip', 'brrip', 'hdtv', 'dvdrip',
+  'remux', 'x264', 'x265', 'h264', 'h265', 'hevc', 'av1', 'aac', 'ac3', 'dts', 'ddp5', 'ddp', 'atmos', 'hdr', 'dv', '10bit', 'amzn', 'nf', 'atvp',
+  'dsnp', 'hmax', 'hulu', 'srt', 'ass', 'vtt', 'eng', 'english', 'en', 'nl', 'dutch', 'hi', 'sdh', 'cc', 'forced', 'proper', 'repack', 'internal', 'multi', 'mkv', 'mp4']);
+const TITLE_STOP = new Set(['the', 'and', 'for', 'with', 'from', 'into']);
+// The episode TITLE in a file name = the words after SxxEyy and before the first quality word.
+function episodeTitleTokens(name) {
+  const base = String(name || '').split('/').pop().replace(/\.(srt|vtt|ass|ssa|sub|mkv|mp4)$/i, '');
+  const m = /s\d{1,2}[ ._-]?e\d{1,3}|(?:^|[^\d])\d{1,2}x\d{1,3}(?!\d)/i.exec(base);
+  if (!m) return [];
+  const out = [];
+  for (const w of base.slice(m.index + m[0].length).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)) {
+    if (QUALITY_WORDS.has(w) || /^\d{3,4}p$/.test(w)) break;
+    if (w.length >= 3 && !TITLE_STOP.has(w)) out.push(w);
+  }
+  return out;
+}
+
+// Chooses the right file inside a multi-episode zip.
+//  1. files named for this season+episode; if several (versions), the closest release to your video, never an HI/SDH one first;
+//  2. episode numbers differ between sources (air vs DVD order): if the numbered file carries a DIFFERENT title while another
+//     file matches your video's episode title, the title wins;
+//  3. nothing fits: refuse (a missing subtitle beats the wrong episode).
+function pickPackEntry(subs, ep) {
+  const re = episodeRegex(ep.season, ep.episode);
+  const baseOf = (e) => e.name.split('/').pop();
+  const vidTitle = ep.filename ? episodeTitleTokens(ep.filename) : [];
+  const overlap = (a, b) => a.filter(w => b.includes(w)).length;
+  const byNumber = subs.filter(e => re.test(baseOf(e)));
+  let pool = byNumber, via = 'number';
+
+  if (vidTitle.length >= 2) {
+    const need = Math.max(2, Math.ceil(vidTitle.length * 0.6));
+    const titleHits = subs.filter(e => overlap(vidTitle, episodeTitleTokens(baseOf(e))) >= need);
+    const numberedAgree = byNumber.some(e => { const t = episodeTitleTokens(baseOf(e)); return t.length === 0 || overlap(vidTitle, t) > 0; });
+    if (titleHits.length && !numberedAgree) { pool = titleHits; via = 'title'; }
+  }
+  if (!pool.length) {
+    const sample = subs.slice(0, 4).map(baseOf).join(', ');
+    throw new Error(`Episode not found in subtitle pack (${subs.length} files, e.g. ${sample.slice(0, 160)})`);
+  }
+  const rank = (e) => {
+    const n = baseOf(e);
+    const hi = /(^|[^a-z])(hi|sdh|cc)([^a-z]|$)/i.test(n);
+    return overlap(vidTitle, episodeTitleTokens(n)) * 50 + scoreSubtitleMatch(n, ep.filename || '') - (hi ? 40 : 0);
+  };
+  const entry = [...pool].sort((x, y) => rank(y) - rank(x))[0];
+  return { entry, matched: pool.length, via };
+}
+
 function episodeOf(type, id) {
   if (type !== 'series') return null;
   const [, S, E] = String(id).split(':');
@@ -1029,9 +1282,14 @@ function decompressSubtitleBuffer(buffer, ep = null) {
       const subs = entries.filter(e => SUB_EXT_RE.test(e.name));
       let pick = subs[0];
       if (ep && subs.length > 1) {
-        const re = episodeRegex(ep.season, ep.episode);
-        pick = subs.find(e => re.test(e.name.split('/').pop()));
-        if (!pick) throw new Error('Episode not found in subtitle pack');
+        const r = pickPackEntry(subs, ep);
+        pick = r.entry;
+        console.log(`[AISUBS] Pack: using "${pick.name.split('/').pop().slice(0, 90)}" for S${String(ep.season).padStart(2, '0')}E${String(ep.episode).padStart(2, '0')} (${subs.length} files, ${r.matched} fit${r.via === 'title' ? ', chosen by episode TITLE because the numbering differs' : ''}).`);
+      } else if (ep && subs.length === 1) {
+        const only = subs[0].name.split('/').pop();
+        if (EPISODE_MARK_RE.test(only) && !episodeRegex(ep.season, ep.episode).test(only)) {
+          throw new Error(`The file in this zip is for another episode (${only.slice(0, 80)})`);
+        }
       }
       if (pick) return decodeText(readZipEntry(buffer, pick));
     }
@@ -1230,13 +1488,13 @@ function findAlignment(refIv, candIv) {
   return { state: 'ok', ratio: best.ratio, lagSec: Math.round(f.lag * fine * 10) / 10, f1: f.f1, conf: best.conf };
 }
 
-async function alignToReference({ cues, refUrl, candUrl, config, type, id }) {
+async function alignToReference({ cues, refUrl, candUrl, config, type, id, filename = '' }) {
   try {
     if (cues.length < 50) return { state: 'unverified' };
     let refIv = refCache.get(refUrl);
     if (!refIv) {
       const { buffer } = await downloadSubtitleWithFallbacks([refUrl], type, id, config);
-      const refCues = parseSubtitleCues(decompressSubtitleBuffer(buffer, episodeOf(type, id)));
+      const refCues = parseSubtitleCues(decompressSubtitleBuffer(buffer, withFilename(episodeOf(type, id), filename)));
       if (!refCues || refCues.length < 50) throw new Error('reference subtitle too short');
       refIv = cuesToIntervals(refCues);
       if (refCache.size >= 30) refCache.delete(refCache.keys().next().value);
@@ -1272,8 +1530,8 @@ function wrapSubtitleLine(t) {
   return best > 0 ? `${t.slice(0, best)}\n${t.slice(best + 1)}` : t;
 }
 
-async function fetchCuesFromCandidates(candidates, type, id, config) {
-  const ep = episodeOf(type, id);
+async function fetchCuesFromCandidates(candidates, type, id, config, filename = '') {
+  const ep = withFilename(episodeOf(type, id), filename);
   let lastErr = new Error('No subtitle candidates');
   for (const url of candidates) {
     try {
@@ -1297,7 +1555,7 @@ const stats = {
   totals: { count: 0, failed: 0, aliased: 0, inTok: 0, outTok: 0, thinkTok: 0, usd: 0, secs: 0 },
   recent: [],    // newest first, max 50
   errors: [],    // newest first, max 20
-  os: { user: null, allowance: null, vip: false, loginAt: null, remaining: null, lastLoginError: null }
+  os: { user: null, allowance: null, vip: false, loginAt: null, remaining: null, remainingAt: null, lastQuotaCheck: 0, lookupOk: null, lastLoginError: null }
 };
 function recordError(text) {
   stats.errors.unshift({ at: Date.now(), text: String(text).slice(0, 220) });
@@ -1349,8 +1607,98 @@ function statusSnapshot() {
     savedTranslations: subCache.size,
     recent: stats.recent,
     errors: stats.errors,
-    openSubtitles: { ...stats.os, quotaUsedUntil: osQuotaUntil > now ? osQuotaUntil : null }
+    openSubtitles: (() => {
+      const d = new Date(now);
+      const dayStart = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+      // A reading from before today's 00:00 UTC reset is out of date: the daily allowance has been restored.
+      const stale = !!stats.os.remainingAt && stats.os.remainingAt < dayStart && stats.os.allowance != null;
+      return { ...stats.os, remaining: stale ? stats.os.allowance : stats.os.remaining, remainingEstimated: stale, quotaUsedUntil: osQuotaUntil > now ? osQuotaUntil : null };
+    })(),
+    storage: { configured: UPSTASH_ON, ttlDays: UPSTASH_TTL_DAYS, hits: upstashState.hits, misses: upstashState.misses, saves: upstashState.saves, errors: upstashState.errors, lastError: upstashState.lastError, pingOk: upstashState.pingOk, pausedNow: now < upstashState.pausedUntil }
   };
+}
+
+// ---- Saved subtitles in Upstash (optional second layer behind the memory cache) -------------------------------
+// Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN in Render to switch it on. Finished subtitles are then kept
+// across restarts and redeploys. Memory stays the fast first stop; if Upstash is slow or down, the addon simply behaves as
+// before (memory only). Only finished subtitle text is stored (under a hashed key), never keys, passwords or settings.
+let UPSTASH_URL = (process.env.UPSTASH_REDIS_REST_URL || '').trim().replace(/\/+$/, '');
+if (UPSTASH_URL && !/^https?:\/\//i.test(UPSTASH_URL)) UPSTASH_URL = `https://${UPSTASH_URL}`;
+const UPSTASH_TOKEN = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
+const UPSTASH_ON = !!(UPSTASH_URL && UPSTASH_TOKEN);
+const UPSTASH_TTL_DAYS = Number(process.env.UPSTASH_TTL_DAYS) > 0 ? Number(process.env.UPSTASH_TTL_DAYS) : 90;
+const UPSTASH_TTL_SEC = Math.round(UPSTASH_TTL_DAYS * 86400);
+const upstashState = { hits: 0, misses: 0, saves: 0, errors: 0, fails: 0, lastError: null, lastOkAt: null, pausedUntil: 0, lastPingAt: 0, pingOk: null, lastLogAt: 0 };
+const upstashKey = (cacheKey) => `aisubs:v1:${crypto.createHash('sha1').update(String(cacheKey)).digest('hex')}`;
+
+function onUpstashError(e) {
+  upstashState.errors++;
+  upstashState.lastError = String(e.message || e).slice(0, 160);
+  // A full database only refuses new writes (reads still work), so it is reported but never pauses reading.
+  if (!/capacity quota/i.test(upstashState.lastError)) {
+    upstashState.fails++;
+    if (upstashState.fails >= 3) upstashState.pausedUntil = Date.now() + 2 * 60 * 1000;   // real outage: stop trying for 2 minutes
+  }
+  if (Date.now() - upstashState.lastLogAt > 60000) {
+    upstashState.lastLogAt = Date.now();
+    console.warn('[AISUBS] Upstash problem:', upstashState.lastError);
+    recordError(`Upstash: ${upstashState.lastError}`);
+  }
+}
+
+async function upstashCall(path, body) {
+  if (!UPSTASH_ON || Date.now() < upstashState.pausedUntil) return null;
+  try {
+    const r = await fetch(UPSTASH_URL + path, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(2500)
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
+    upstashState.fails = 0;
+    upstashState.lastOkAt = Date.now();
+    return j;
+  } catch (e) {
+    onUpstashError(e);
+    return null;
+  }
+}
+
+async function upstashGetVtt(cacheKey) {
+  const j = await upstashCall('', ['GET', upstashKey(cacheKey)]);
+  if (!j) return null;
+  if (!j.result) { upstashState.misses++; return null; }
+  try {
+    const vtt = zlib.gunzipSync(Buffer.from(String(j.result), 'base64')).toString('utf-8');
+    upstashState.hits++;
+    return vtt;
+  } catch (e) {
+    onUpstashError(new Error('a saved subtitle could not be read back'));
+    return null;
+  }
+}
+
+function upstashSaveVtt(cacheKey, vtt) {   // fire and forget: never makes a player wait
+  if (!UPSTASH_ON) return;
+  const packed = zlib.gzipSync(Buffer.from(vtt, 'utf-8')).toString('base64');
+  upstashCall('', ['SET', upstashKey(cacheKey), packed, 'EX', UPSTASH_TTL_SEC]).then(j => { if (j) upstashState.saves++; });
+}
+
+async function upstashReadyFlags(cacheKeys) {   // which of these are already saved? (one request, tiny reply)
+  const j = await upstashCall('/pipeline', cacheKeys.map(k => ['EXISTS', upstashKey(k)]));
+  return Array.isArray(j) ? j.map(x => Number(x?.result) === 1) : cacheKeys.map(() => false);
+}
+
+if (UPSTASH_ON) {
+  upstashCall('', ['PING']).then(j => {
+    upstashState.pingOk = !!j; upstashState.lastPingAt = Date.now();
+    console.log(j ? `[AISUBS] Upstash connected - subtitles are kept for ${UPSTASH_TTL_DAYS} days, across restarts.`
+                  : '[AISUBS] Upstash is set up but not reachable yet - check the URL and token (see the status page).');
+  });
+} else {
+  console.log('[AISUBS] Upstash not set up - saved subtitles live in memory only (lost on restart).');
 }
 
 // ---- Shared translations ---------------------------------------------------------------------------------
@@ -1437,15 +1785,15 @@ function getSharedTranslation(sourceTexts, config) {
 
 const translationTimes = [];   // seconds per finished translation (last 50), for the running average in the log
 
-async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
+async function generateVtt({ config, candidates, type, id, raw, refUrl, noBanner = false, filename = '' }) {
   const t0 = Date.now();
   const ctx = { errors: [] };
   let missed = 0;
-  const cues = await fetchCuesFromCandidates(candidates, type, id, config);
+  const cues = await fetchCuesFromCandidates(candidates, type, id, config, filename);
   console.log(`[AISUBS] Parsed ${cues.length} cues.`);
 
   if (refUrl && candidates[0] && refUrl !== candidates[0]) {
-    const st = await alignToReference({ cues, refUrl, candUrl: candidates[0], config, type, id });
+    const st = await alignToReference({ cues, refUrl, candUrl: candidates[0], config, type, id, filename });
     console.log(`[AISUBS] Sync check: ${st.state}${st.state === 'corrected' ? ` (shift ${st.lagSec}s, speed x${st.ratio})` : ''}`);
   }
   const sourceTexts = cues.map(c => c.text);   // untouched originals, used as read-only context for translation
@@ -1486,7 +1834,7 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
     console.error(`[AISUBS] Translation failed for ${missed}/${cues.length} cues. First error: ${reason}`);
     recordError(`Translation failed for ${id}: ${reason}`);
     if (!wasReused) recordTranslation({ id, type, cues: cues.length, missed, secs: (Date.now() - t0) / 1000, usd: sharedInfo?.usd || 0, model: sharedInfo?.models?.length ? sharedInfo.models.join(' + ') : config.model, ok: false });
-    return { vtt: buildWebVTT(cues, `Translation failed ✗ (${pct}% translated) - ${reason}`), cacheable: false };   // don't cache a failure
+    return { vtt: buildWebVTT(cues, `Translation failed ✗ (${pct}% translated) - ${reason}`), cacheable: false, missed, cues: cues.length };   // don't cache a failure
   }
 
   if (raw !== 'true' && !wasReused) {
@@ -1498,8 +1846,8 @@ async function generateVtt({ config, candidates, type, id, raw, refUrl }) {
     console.log(`[AISUBS] Translation took ${secs.toFixed(1)}s (${cues.length} cues, ${missed} missed) | average ${avg.toFixed(1)}s over ${translationTimes.length} run(s)`);
   }
 
-  const banner = raw === 'true' ? '' : (missed === 0 ? 'Translation Started ✅' : `Translation Started ✅ (${pct}% translated)`);
-  return { vtt: buildWebVTT(cues, banner), cacheable: true };
+  const banner = (raw === 'true' || noBanner) ? '' : (missed === 0 ? 'Translation Started ✅' : `Translation Started ✅ (${pct}% translated)`);
+  return { vtt: buildWebVTT(cues, banner), cacheable: true, missed, cues: cues.length };
 }
 
 // One key function, so the menu can tell which translations are already saved (the ⚡ marker).
@@ -1527,7 +1875,7 @@ function noteBurst(titleKey, cacheKey, promise, running) {
 }
 
 app.get('/sub.vtt', async (req, res) => {
-  const { cfg, src, alt, ref, type, id, raw } = req.query;
+  const { cfg, src, alt, ref, type, id, raw, fn } = req.query;
   const config = parseConfig(cfg);
   stats.lastModel = resolveGeminiModel(config.model);
   const candidates = [decodeSourceParam(src), decodeSourceParam(alt)].filter(Boolean);
@@ -1537,6 +1885,7 @@ app.get('/sub.vtt', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
   const isAi = raw !== 'true';
+  const isUpload = String(candidates[0] || '').startsWith('upload://');   // uploads are memory-only
   const titleKey = `${type}|${id}|${config.lang}|${config.provider}|${config.model}|${config.bilingual}|${config.offsetMs}`;
   console.log(`[AISUBS] Track request (${isAi ? 'AI' : 'native'}) from ${String(req.get('user-agent') || '?').slice(0, 70)}`);
 
@@ -1549,9 +1898,19 @@ app.get('/sub.vtt', async (req, res) => {
   const recentFail = failCache.get(cacheKey);
   if (recentFail && recentFail.until > Date.now()) return res.send(recentFail.vtt);
 
+  if (UPSTASH_ON && !isUpload) {              // saved before a restart? load it instead of paying again
+    const saved = await upstashGetVtt(cacheKey);
+    if (saved) {
+      console.log('[AISUBS] Served a saved subtitle from Upstash (no download, no translation).');
+      setInCache(cacheKey, saved);
+      if (isAi && BURST_WINDOW_MS > 0) noteBurst(titleKey, cacheKey, Promise.resolve({ vtt: saved }), false);
+      return res.send(saved);
+    }
+  }
+
   if (isAi && BURST_WINDOW_MS > 0) {
     const b = titleBursts.get(titleKey);
-    if (b && b.cacheKey !== cacheKey && (b.running || Date.now() - b.startedAt <= BURST_WINDOW_MS)) {
+    if (b && b.cacheKey !== cacheKey && !String(candidates[0] || '').startsWith('upload://') && (b.running || Date.now() - b.startedAt <= BURST_WINDOW_MS)) {
       console.log('[AISUBS] Another track of the same title was requested right after the first - serving the first translation instead of paying for a second.');
       stats.totals.aliased++;
       try { const { vtt } = await b.promise; return res.send(vtt); } catch (e) { /* first one failed: translate this one itself */ }
@@ -1561,13 +1920,13 @@ app.get('/sub.vtt', async (req, res) => {
   try {
     let job = inflight.get(cacheKey);
     if (!job) {
-      job = generateVtt({ config, candidates, type, id, raw, refUrl });
+      job = generateVtt({ config, candidates, type, id, raw, refUrl, filename: fn || '' });
       inflight.set(cacheKey, job);
       const rec = (isAi && BURST_WINDOW_MS > 0) ? noteBurst(titleKey, cacheKey, job, true) : null;
       job.finally(() => { inflight.delete(cacheKey); if (rec) rec.running = false; }).catch(() => {});
     }
     const { vtt, cacheable } = await job;
-    if (cacheable) setInCache(cacheKey, vtt);
+    if (cacheable) { setInCache(cacheKey, vtt); if (!isUpload) upstashSaveVtt(cacheKey, vtt); }
     else failCache.set(cacheKey, { vtt, until: Date.now() + 120000 });   // retry allowed after 2 min
     res.send(vtt);
   } catch (err) {

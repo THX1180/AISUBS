@@ -214,3 +214,14 @@ input:checked + .slider:before { transform: translateX(20px); background: var(--
   .badge { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+/* Upload a subtitle */
+input[type="file"] { width: 100%; color: var(--muted); font-size: 0.88rem; }
+input[type="file"]::file-selector-button {
+  background: var(--raised); color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 0.5rem 0.8rem; margin-right: 0.7rem; cursor: pointer; font-weight: 600;
+}
+.up-item { background: var(--raised); border: 1px solid var(--line); border-radius: 12px; padding: 0.8rem 0.9rem; margin-bottom: 0.6rem; }
+.up-name { font-weight: 600; font-size: 0.9rem; word-break: break-word; }
+.up-meta { color: var(--muted); font-size: 0.78rem; margin: 0.15rem 0 0.6rem; }
+.up-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
