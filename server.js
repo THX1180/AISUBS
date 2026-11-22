@@ -7,6 +7,8 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { getManifest } from './manifest.js';
 
+const BUILD = '2026-11-22-menus';   // shown in the log and on the status page, to confirm which version is deployed
+console.log(`[AISUBS] Build ${BUILD}`);
 const app = express();
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 
@@ -262,6 +264,8 @@ h2{font-size:1rem;margin:1.3rem 0 .5rem}
 <div class="grid" id="cards"></div>
 <h2>OpenSubtitles</h2><div class="box" id="os"></div>
 <h2>Saved subtitles (Upstash)</h2><div class="box" id="store"></div>
+<h2>Uploaded subtitles</h2><div class="box" id="ups"></div>
+<h2>Recent menus (titles opened in Nuvio)</h2><div class="box" id="menus"></div>
 <h2>Recent translations</h2><div class="box" id="recent"></div>
 <h2>Recent problems</h2><div class="box" id="errs"></div>
 <p class="sub" style="margin-top:1.2rem" id="foot"></p>
@@ -297,11 +301,22 @@ function render(d){
   else{
     var bad=sg.pausedNow||sg.pingOk===false;
     kv(stg,'Status',sg.pausedNow?'problem - paused for a moment':(sg.pingOk===false?'cannot connect':'connected'),bad?'bad':'ok');
-    kv(stg,'Saved this session',String(sg.saves));
+    kv(stg,'Saved this session',String(sg.saves)+(sg.savesRaw?' ('+sg.savesAi+' translated, '+sg.savesRaw+' ready-made Dutch)':''));
     kv(stg,'Loaded from storage',String(sg.hits));
     kv(stg,'Kept for',sg.ttlDays+' days');
     if(sg.lastError)kv(stg,'Last problem',sg.lastError,'bad');
   }
+  var ups=$('ups');ups.textContent='';
+  if(!d.uploads.length){ups.appendChild(el('div','row muted','No uploads on the server (a restart clears them).'));}
+  d.uploads.forEach(function(u){var r=el('div','row');r.appendChild(el('div','',u.key));r.appendChild(el('div','m',u.name+' \u00B7 '+(u.mode==='translate'?'to translate':'used as it is')+' \u00B7 '+u.status+' \u00B7 uploaded '+ago(d.now-u.createdAt)));ups.appendChild(r);});
+  var mn=$('menus');mn.textContent='';
+  if(!d.menus.length){mn.appendChild(el('div','row muted','No menu requested since the last restart.'));}
+  d.menus.slice(0,8).forEach(function(m){
+    var r=el('div','row');var hit=m.uploads>0;
+    r.appendChild(el('div',hit?'ok':'',m.id+' \u00B7 '+m.tracks+' tracks'+(hit?' \u00B7 \uD83D\uDCC2 '+m.uploads+' upload pinned on top':' \u00B7 no upload for this title')));
+    r.appendChild(el('div','m',(m.near&&m.near.length?'You have uploads for '+m.near.join(', ')+' of this title, but not for this one. ':'')+ago(d.now-m.at)));
+    if(m.top&&m.top[0])r.appendChild(el('div','m','Top entry sent: '+String(m.top[0]).slice(0,90)));
+    mn.appendChild(r);});
   var rc=$('recent');rc.textContent='';
   if(!d.recent.length){rc.appendChild(el('div','row muted','Nothing translated since the last restart.'));}
   d.recent.slice(0,10).forEach(function(e){
@@ -316,7 +331,7 @@ function render(d){
   $('upd').textContent='Updated '+new Date(d.now).toLocaleTimeString()+' \u00B7 since last restart \u00B7 refreshes every 15s';
   var used={};d.recent.forEach(function(e){String(e.model).split(' + ').forEach(function(m){used[m]=1;});});if(d.modelInUse)used[d.modelInUse]=1;
   var pr=Object.keys(used).map(function(m){var p=d.prices[m];return p?m+' $'+p[0]+' in / $'+p[1]+' out':m+' (price not in table, Flash-Lite rate used)';}).join(' \u00B7 ');
-  $('foot').textContent=(t.aliased?t.aliased+' duplicate track requests skipped \u00B7 ':'')+(d.modelInUse?'Model in use '+d.modelInUse+' (from your install page)':'Model in use: not seen yet')+' \u00B7 fallback default '+d.model+' \u00B7 '+d.savedTranslations+' saved translations in memory \u00B7 pace '+d.pacing.minIntervalMs+' ms, '+d.pacing.concurrency+' at a time \u00B7 prices per 1M tokens: '+(pr||'none used yet')+' \u00B7 1 USD = '+fx.eurPerUsd.toFixed(4)+' EUR ('+fx.source+(fx.date?' '+fx.date:'')+')';
+  $('foot').textContent=(t.aliased?t.aliased+' duplicate track requests skipped \u00B7 ':'')+(d.modelInUse?'Model in use '+d.modelInUse+' (from your install page)':'Model in use: not seen yet')+' \u00B7 fallback default '+d.model+' \u00B7 '+d.savedTranslations+' saved translations in memory \u00B7 pace '+d.pacing.minIntervalMs+' ms, '+d.pacing.concurrency+' at a time \u00B7 prices per 1M tokens: '+(pr||'none used yet')+' \u00B7 1 USD = '+fx.eurPerUsd.toFixed(4)+' EUR ('+fx.source+(fx.date?' '+fx.date:'')+')'+' \u00B7 build '+d.build;
 }
 function load(){fetch('status.json',{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(render).catch(function(e){$('upd').textContent='Could not load: '+e.message;});}
 load();setInterval(load,15000);
@@ -1023,7 +1038,12 @@ app.get(/\/subtitles\//, async (req, res) => {
     rankedEn, rankedTarget, targetName: config.langName || 'Dutch', iso3: L.iso3, mkUrl
   });
 
-  if (uploadsFor(fullId).length) console.log(`[AISUBS] Menu for ${fullId}: ${uploadsFor(fullId).length} uploaded subtitle(s) pinned on top.`);
+  const pinnedHere = uploadsFor(fullId).length;
+  const near = [...uploads.values()].filter(u => u.imdb === String(imdbId).toLowerCase() && uploadKey(u) !== String(fullId).toLowerCase())
+    .map(u => (u.season ? `S${String(u.season).padStart(2, '0')}E${String(u.episode).padStart(2, '0')}` : 'the movie'));
+  recordMenu({ id: fullId, tracks: out.length, uploads: pinnedHere, near, top: out.slice(0, 3).map(t => t.id) });
+  if (pinnedHere) console.log(`[AISUBS] Menu for ${fullId}: ${pinnedHere} uploaded subtitle(s) pinned on top.`);
+  else if (near.length) console.log(`[AISUBS] Menu for ${fullId}: no upload matches, but you have uploads for ${near.join(', ')} of this title.`);
   return res.json({ subtitles: out, cacheMaxAge: 10 });
 });
 
@@ -1615,9 +1635,16 @@ const stats = {
   lastModel: null,   // model most recently requested by your install (not the server fallback)
   totals: { count: 0, failed: 0, aliased: 0, inTok: 0, outTok: 0, thinkTok: 0, usd: 0, secs: 0 },
   recent: [],    // newest first, max 50
+  menus: [],     // last title menus served: what the app asked for, and whether an upload matched
   errors: [],    // newest first, max 20
   os: { user: null, allowance: null, vip: false, loginAt: null, remaining: null, remainingAt: null, lastQuotaCheck: 0, lookupOk: null, lastLoginError: null }
 };
+function recordMenu(m) {
+  const now = Date.now();
+  if (stats.menus[0] && stats.menus[0].id === m.id) stats.menus[0] = { ...m, at: now };   // the app often asks twice in a row
+  else stats.menus.unshift({ ...m, at: now });
+  if (stats.menus.length > 12) stats.menus.pop();
+}
 function recordError(text) {
   stats.errors.unshift({ at: Date.now(), text: String(text).slice(0, 220) });
   if (stats.errors.length > 20) stats.errors.pop();
@@ -1665,7 +1692,10 @@ function statusSnapshot() {
     prices: GEMINI_PRICES,
     fx: { eurPerUsd: fxState.eurPerUsd, date: fxState.date, source: fxState.source },
     totals: { ...t, avgSecs: t.count ? t.secs / t.count : 0 },
+    build: BUILD,
     savedTranslations: subCache.size,
+    menus: stats.menus,
+    uploads: [...uploads.values()].map(u => ({ key: uploadKey(u), name: u.name, mode: u.mode, status: u.status, createdAt: u.createdAt })),
     recent: stats.recent,
     errors: stats.errors,
     openSubtitles: (() => {
@@ -1675,7 +1705,7 @@ function statusSnapshot() {
       const stale = !!stats.os.remainingAt && stats.os.remainingAt < dayStart && stats.os.allowance != null;
       return { ...stats.os, remaining: stale ? stats.os.allowance : stats.os.remaining, remainingEstimated: stale, quotaUsedUntil: osQuotaUntil > now ? osQuotaUntil : null };
     })(),
-    storage: { configured: UPSTASH_ON, ttlDays: UPSTASH_TTL_DAYS, hits: upstashState.hits, misses: upstashState.misses, saves: upstashState.saves, errors: upstashState.errors, lastError: upstashState.lastError, pingOk: upstashState.pingOk, pausedNow: now < upstashState.pausedUntil }
+    storage: { configured: UPSTASH_ON, ttlDays: UPSTASH_TTL_DAYS, hits: upstashState.hits, misses: upstashState.misses, saves: upstashState.saves, savesAi: upstashState.savesAi, savesRaw: upstashState.savesRaw, errors: upstashState.errors, lastError: upstashState.lastError, pingOk: upstashState.pingOk, pausedNow: now < upstashState.pausedUntil }
   };
 }
 
@@ -1689,7 +1719,7 @@ const UPSTASH_TOKEN = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
 const UPSTASH_ON = !!(UPSTASH_URL && UPSTASH_TOKEN);
 const UPSTASH_TTL_DAYS = Number(process.env.UPSTASH_TTL_DAYS) > 0 ? Number(process.env.UPSTASH_TTL_DAYS) : 90;
 const UPSTASH_TTL_SEC = Math.round(UPSTASH_TTL_DAYS * 86400);
-const upstashState = { hits: 0, misses: 0, saves: 0, errors: 0, fails: 0, lastError: null, lastOkAt: null, pausedUntil: 0, lastPingAt: 0, pingOk: null, lastLogAt: 0 };
+const upstashState = { hits: 0, misses: 0, saves: 0, savesAi: 0, savesRaw: 0, errors: 0, fails: 0, lastError: null, lastOkAt: null, pausedUntil: 0, lastPingAt: 0, pingOk: null, lastLogAt: 0 };
 const upstashKey = (cacheKey) => `aisubs:v1:${crypto.createHash('sha1').update(String(cacheKey)).digest('hex')}`;
 
 function onUpstashError(e) {
@@ -1741,10 +1771,12 @@ async function upstashGetVtt(cacheKey) {
   }
 }
 
-function upstashSaveVtt(cacheKey, vtt) {   // fire and forget: never makes a player wait
+function upstashSaveVtt(cacheKey, vtt, isAi = true) {   // fire and forget: never makes a player wait
   if (!UPSTASH_ON) return;
   const packed = zlib.gzipSync(Buffer.from(vtt, 'utf-8')).toString('base64');
-  upstashCall('', ['SET', upstashKey(cacheKey), packed, 'EX', UPSTASH_TTL_SEC]).then(j => { if (j) upstashState.saves++; });
+  upstashCall('', ['SET', upstashKey(cacheKey), packed, 'EX', UPSTASH_TTL_SEC]).then(j => {
+    if (j) { upstashState.saves++; if (isAi) upstashState.savesAi++; else upstashState.savesRaw++; }
+  });
 }
 
 async function upstashReadyFlags(cacheKeys) {   // which of these are already saved? (one request, tiny reply)
@@ -1987,7 +2019,7 @@ app.get('/sub.vtt', async (req, res) => {
       job.finally(() => { inflight.delete(cacheKey); if (rec) rec.running = false; }).catch(() => {});
     }
     const { vtt, cacheable } = await job;
-    if (cacheable) { setInCache(cacheKey, vtt); if (!isUpload) upstashSaveVtt(cacheKey, vtt); }
+    if (cacheable) { setInCache(cacheKey, vtt); if (!isUpload) upstashSaveVtt(cacheKey, vtt, isAi); }
     else failCache.set(cacheKey, { vtt, until: Date.now() + 120000 });   // retry allowed after 2 min
     res.send(vtt);
   } catch (err) {
