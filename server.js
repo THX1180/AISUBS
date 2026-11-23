@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { getManifest } from './manifest.js';
 
-const BUILD = '2026-11-22-menus';   // shown in the log and on the status page, to confirm which version is deployed
+const BUILD = '2026-11-22-recent';   // shown in the log and on the status page, to confirm which version is deployed
 console.log(`[AISUBS] Build ${BUILD}`);
 const app = express();
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -106,17 +106,19 @@ function vttToSrt(vtt) {
 
 // Asks Stremio's public Cinemeta what an IMDb id is, so a wrong kind (movie vs series) is caught at upload time.
 async function lookupTitle(tt) {
+  let notFound = 0;
   for (const kind of ['series', 'movie']) {
     try {
       const r = await fetch(`https://v3-cinemeta.strem.io/meta/${kind}/${tt}.json`, { signal: AbortSignal.timeout(3000) });
-      if (!r.ok) continue;
+      if (!r.ok) { if (r.status === 404 || r.status === 400) notFound++; continue; }
       const j = await r.json();
       if (j?.meta?.name) return { kind, name: String(j.meta.name) };
+      notFound++;
     } catch (e) {
       return null;           // offline or slow: skip the check rather than block the upload
     }
   }
-  return null;
+  return notFound === 2 ? { kind: 'unknown' } : null;   // both answered "no such title"
 }
 
 // Translates a fresh upload in the background, so it is already done (⚡) when you open the title in Nuvio.
@@ -151,7 +153,7 @@ async function pretranslateUpload(rec, config) {
 
 app.post('/api/uploads', async (req, res) => {
   try {
-    const { name, data, imdb, season, episode, mode, cfg, translateNow } = req.body || {};
+    const { name, data, imdb, season, episode, mode, cfg, translateNow, force } = req.body || {};
     const tt = String(imdb || '').trim().toLowerCase();
     if (!/^tt\d{5,10}$/.test(tt)) return res.status(400).json({ error: 'The IMDb id should look like tt1234567.' });
     const S = season ? Number(season) : null, E = episode ? Number(episode) : null;
@@ -169,6 +171,26 @@ app.post('/api/uploads', async (req, res) => {
     const info = await lookupTitle(tt);
     if (info && info.kind === 'series' && !S) return res.status(400).json({ error: `${info.name} is a series: fill in the season and episode.` });
     if (info && info.kind === 'movie' && S) return res.status(400).json({ error: `${info.name} is a movie: leave season and episode empty.` });
+
+    // Only step in when Stremio does not recognise the id you typed (typically a single EPISODE's own IMDb id). A valid,
+    // different title is a legitimate target and goes through without questions.
+    const recent = recentTitles();
+    if (force !== true && info && info.kind === 'unknown' && !recent.some(t => t.imdb === tt)) {
+      // Nuvio asks for the SERIES id plus season and episode. If you recently opened that same episode under another id,
+      // you almost certainly meant that one.
+      const hit = recent.find(t => t.imdb !== tt && t.season === S && t.episode === E && Date.now() - t.at < 6 * 3600 * 1000);
+      if (hit) {
+        const label = hit.season ? ` S${String(hit.season).padStart(2, '0')}E${String(hit.episode).padStart(2, '0')}` : '';
+        return res.status(409).json({
+          error: `Nuvio recently opened ${hit.imdb}${label}${hit.file ? ` (${hit.file})` : ''}, not ${tt}. Nuvio uses the SERIES id with season and episode, so an upload under ${tt} would never show up.`,
+          suggestImdb: hit.imdb
+        });
+      }
+      return res.status(409).json({
+        error: `${tt} is not a movie or series that Stremio knows. If it is the IMDb id of a single EPISODE, use the id of the SERIES instead (the show's own page).`,
+        canForce: true
+      });
+    }
 
     let cues;
     try {
@@ -199,6 +221,8 @@ app.post('/api/uploads', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+app.get('/api/recent-titles', (req, res) => res.json({ titles: recentTitles().slice(0, 12) }));
 
 app.get('/api/uploads', (req, res) => {
   res.json({
@@ -314,7 +338,7 @@ function render(d){
   d.menus.slice(0,8).forEach(function(m){
     var r=el('div','row');var hit=m.uploads>0;
     r.appendChild(el('div',hit?'ok':'',m.id+' \u00B7 '+m.tracks+' tracks'+(hit?' \u00B7 \uD83D\uDCC2 '+m.uploads+' upload pinned on top':' \u00B7 no upload for this title')));
-    r.appendChild(el('div','m',(m.near&&m.near.length?'You have uploads for '+m.near.join(', ')+' of this title, but not for this one. ':'')+ago(d.now-m.at)));
+    r.appendChild(el('div','m',(m.near&&m.near.length?'You have uploads for '+m.near.join(', ')+' of this title, but not for this one. ':'')+(m.otherId&&m.otherId.length?'Your upload for '+m.otherId.join(', ')+' uses a different IMDb id than Nuvio does ('+String(m.id).split(':')[0]+'). ':'')+ago(d.now-m.at)));
     if(m.top&&m.top[0])r.appendChild(el('div','m','Top entry sent: '+String(m.top[0]).slice(0,90)));
     mn.appendChild(r);});
   var rc=$('recent');rc.textContent='';
@@ -1041,9 +1065,13 @@ app.get(/\/subtitles\//, async (req, res) => {
   const pinnedHere = uploadsFor(fullId).length;
   const near = [...uploads.values()].filter(u => u.imdb === String(imdbId).toLowerCase() && uploadKey(u) !== String(fullId).toLowerCase())
     .map(u => (u.season ? `S${String(u.season).padStart(2, '0')}E${String(u.episode).padStart(2, '0')}` : 'the movie'));
-  recordMenu({ id: fullId, tracks: out.length, uploads: pinnedHere, near, top: out.slice(0, 3).map(t => t.id) });
+  const otherId = pinnedHere ? [] : [...uploads.values()]
+    .filter(u => (u.season || null) === (season ? Number(season) : null) && (u.episode || null) === (episode ? Number(episode) : null) && u.imdb !== String(imdbId).toLowerCase())
+    .map(u => `${u.imdb}${u.season ? ` S${String(u.season).padStart(2, '0')}E${String(u.episode).padStart(2, '0')}` : ''}`);
+  recordMenu({ id: fullId, tracks: out.length, uploads: pinnedHere, near, otherId, file: String(filename || '').slice(0, 120), top: out.slice(0, 3).map(t => t.id) });
   if (pinnedHere) console.log(`[AISUBS] Menu for ${fullId}: ${pinnedHere} uploaded subtitle(s) pinned on top.`);
   else if (near.length) console.log(`[AISUBS] Menu for ${fullId}: no upload matches, but you have uploads for ${near.join(', ')} of this title.`);
+  else if (otherId.length) console.log(`[AISUBS] Menu for ${fullId}: no upload matches. Your upload for ${otherId.join(', ')} uses a DIFFERENT IMDb id than the app (${imdbId}).`);
   return res.json({ subtitles: out, cacheMaxAge: 10 });
 });
 
@@ -1643,7 +1671,17 @@ function recordMenu(m) {
   const now = Date.now();
   if (stats.menus[0] && stats.menus[0].id === m.id) stats.menus[0] = { ...m, at: now };   // the app often asks twice in a row
   else stats.menus.unshift({ ...m, at: now });
-  if (stats.menus.length > 12) stats.menus.pop();
+  if (stats.menus.length > 25) stats.menus.pop();
+}
+function recentTitles() {                    // unique titles, newest first
+  const seen = new Set(), out = [];
+  for (const m of stats.menus) {
+    if (seen.has(m.id)) continue;
+    seen.add(m.id);
+    const [imdb, S, E] = String(m.id).split(':');
+    out.push({ id: m.id, imdb, season: S ? Number(S) : null, episode: E ? Number(E) : null, file: m.file || '', at: m.at });
+  }
+  return out;
 }
 function recordError(text) {
   stats.errors.unshift({ at: Date.now(), text: String(text).slice(0, 220) });

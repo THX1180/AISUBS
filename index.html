@@ -259,9 +259,16 @@
         <input type="file" id="upFile" accept=".srt,.vtt,.ass,.ssa,.sub,.zip">
       </div>
       <div class="form-group">
+        <label for="upRecent">Easiest: pick a title you just opened in Nuvio</label>
+        <div class="select-wrapper">
+          <select id="upRecent"><option value="">Open the title in Nuvio first, then tap here</option></select>
+        </div>
+        <span class="helper">This fills in the IMDb id, season and episode exactly as Nuvio uses them.</span>
+      </div>
+      <div class="form-group">
         <label for="upImdb">IMDb id</label>
         <input type="text" id="upImdb" placeholder="tt1234567" autocomplete="off" autocapitalize="off" spellcheck="false">
-        <span class="helper">The tt… number in the title's IMDb web address.</span>
+        <span class="helper">Use the id of the SERIES (the show's own page), not of a single episode.</span>
       </div>
       <div class="grid-2">
         <div class="form-group">
@@ -753,7 +760,7 @@
       const upFile = document.getElementById('upFile'), upImdb = document.getElementById('upImdb');
       const upSeason = document.getElementById('upSeason'), upEpisode = document.getElementById('upEpisode');
       const upMode = document.getElementById('upMode'), upBtn = document.getElementById('upBtn');
-      const upNow = document.getElementById('upNow'), upNowRow = document.getElementById('upNowRow');
+      const upNow = document.getElementById('upNow'), upNowRow = document.getElementById('upNowRow'), upRecent = document.getElementById('upRecent');
       const upStatus = document.getElementById('upStatus'), upList = document.getElementById('upList');
       let pollTimer = null;
 
@@ -773,9 +780,35 @@
       async function api(path, opts) {
         const res = await fetch(TOKEN_PREFIX + path, opts);
         const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.error || ('Server said HTTP ' + res.status));
+        if (!res.ok) { const err = new Error(data.error || ('Server said HTTP ' + res.status)); err.status = res.status; err.data = data; throw err; }
         return data;
       }
+      function ago(ms) { const m = Math.round(ms / 60000); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : Math.round(m / 60) + ' h ago'; }
+      let recentTitles = [];
+      async function loadRecent() {
+        try {
+          const data = await api('/api/recent-titles');
+          recentTitles = data.titles || [];
+          const keep = upRecent.value;
+          upRecent.textContent = '';
+          const first = document.createElement('option'); first.value = '';
+          first.textContent = recentTitles.length ? 'Choose a title...' : 'Open the title in Nuvio first, then tap here';
+          upRecent.appendChild(first);
+          recentTitles.forEach(function (t, i) {
+            const o = document.createElement('option'); o.value = String(i);
+            o.textContent = (t.file || t.imdb) + ' \u00B7 ' + t.imdb + (t.season ? ' S' + String(t.season).padStart(2, '0') + 'E' + String(t.episode).padStart(2, '0') : '') + ' \u00B7 ' + ago(Date.now() - t.at);
+            upRecent.appendChild(o);
+          });
+          upRecent.value = keep && recentTitles[Number(keep)] ? keep : '';
+        } catch (e) { /* not on the token address: the upload box explains it */ }
+      }
+      upRecent.addEventListener('focus', loadRecent);
+      upRecent.addEventListener('mousedown', loadRecent);
+      upRecent.addEventListener('change', function () {
+        const t = recentTitles[Number(upRecent.value)];
+        if (!t) return;
+        upImdb.value = t.imdb; upSeason.value = t.season || ''; upEpisode.value = t.episode || '';
+      });
       upMode.addEventListener('change', function () { upNowRow.style.display = upMode.value === 'translate' ? '' : 'none'; });
 
       function statusLine(u) {
@@ -852,12 +885,29 @@
         upBtn.disabled = true; msg('Uploading...');
         try {
           const data = await fileToBase64(file);
-          const r = await api('/api/uploads', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name: file.name, data: data, imdb: upImdb.value.trim(), season: s, episode: e, mode: upMode.value,
-              cfg: configB64(), translateNow: upNow.checked })
-          });
-          const what = r.title ? r.title + (s ? ' S' + s.padStart(2, '0') + 'E' + e.padStart(2, '0') : '') : upImdb.value.trim();
+          const send = function (force) {
+            return api('/api/uploads', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: file.name, data: data, imdb: upImdb.value.trim(), season: upSeason.value.trim(), episode: upEpisode.value.trim(),
+                mode: upMode.value, cfg: configB64(), translateNow: upNow.checked, force: force === true })
+            });
+          };
+          let r;
+          try { r = await send(false); }
+          catch (err) {
+            if (err.status !== 409 || !err.data) throw err;
+            if (err.data.suggestImdb) {                                   // the id differs from what Nuvio uses
+              if (window.confirm(err.data.error + '\n\nOK = use ' + err.data.suggestImdb + ' instead.\nCancel = keep ' + upImdb.value.trim() + '.')) {
+                upImdb.value = err.data.suggestImdb; r = await send(false);
+              } else if (window.confirm('Upload for ' + upImdb.value.trim() + ' anyway?')) { r = await send(true); }
+              else { upBtn.disabled = false; return msg('Upload cancelled.'); }
+            } else if (err.data.canForce) {
+              if (window.confirm(err.data.error + '\n\nUpload anyway?')) { r = await send(true); }
+              else { upBtn.disabled = false; return msg('Upload cancelled. Pick the title from the list above, or use the series id.'); }
+            } else throw err;
+          }
+          const s = upSeason.value.trim(), e = upEpisode.value.trim();
+          const what = r.title ? r.title + (s ? ' S' + String(s).padStart(2, '0') + 'E' + String(e).padStart(2, '0') : '') : upImdb.value.trim();
           msg('Uploaded for ' + what + ' (' + r.cues + ' lines). ' + (r.status === 'translating' ? 'Translating now. It will be at the top of the list in Nuvio as \uD83D\uDCC2\u26A1 when done.' : 'Look for the \uD83D\uDCC2 entry at the top of the list in Nuvio.'));
           upFile.value = '';
           refresh();
@@ -866,6 +916,7 @@
       });
 
       refresh();
+      loadRecent();
     })();
   </script>
 </body>
