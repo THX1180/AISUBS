@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { getManifest } from './manifest.js';
 
-const BUILD = '2026-11-22-recent';   // shown in the log and on the status page, to confirm which version is deployed
+const BUILD = '2026-11-24-sync';   // shown in the log and on the status page, to confirm which version is deployed
 console.log(`[AISUBS] Build ${BUILD}`);
 const app = express();
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -121,6 +121,13 @@ async function lookupTitle(tt) {
   return notFound === 2 ? { kind: 'unknown' } : null;   // both answered "no such title"
 }
 
+// An upload counts as "ready" (⚡) after any successful translation: the Download button, Nuvio playing it, or a cache hit.
+function markUploadReady(url) {
+  const m = /^upload:\/\/(.+)$/.exec(String(url || ''));
+  const u = m && uploads.get(m[1]);
+  if (u && u.mode === 'translate' && u.status !== 'translating') { u.status = 'ready'; u.error = null; }
+}
+
 // Translates a fresh upload in the background, so it is already done (⚡) when you open the title in Nuvio.
 // It uses the same cache key and in-flight job as the player, so a player asking meanwhile simply joins it.
 async function pretranslateUpload(rec, config) {
@@ -225,9 +232,12 @@ app.post('/api/uploads', async (req, res) => {
 app.get('/api/recent-titles', (req, res) => res.json({ titles: recentTitles().slice(0, 12) }));
 
 app.get('/api/uploads', (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   res.json({
+    now: Date.now(),
     uploads: [...uploads.values()].reverse().map(u => ({
-      id: u.id, name: u.name, title: u.title, imdb: u.imdb, season: u.season, episode: u.episode, mode: u.mode, cues: u.cues, size: u.bytes.length, createdAt: u.createdAt, status: u.status, error: u.error
+      id: u.id, name: u.name, title: u.title, imdb: u.imdb, season: u.season, episode: u.episode, mode: u.mode, cues: u.cues, size: u.bytes.length, createdAt: u.createdAt, status: u.status, error: u.error,
+      served: u.served || 0, lastServedAt: u.lastServedAt || null
     }))
   });
 });
@@ -249,6 +259,7 @@ app.post('/api/uploads/:id/translate', async (req, res) => {
     if (!result.cacheable) {
       return res.status(502).json({ error: 'The translation did not complete (rate limit or an API problem). Check the status page, then try again.' });
     }
+    markUploadReady(`upload://${u.id}`);
     const srt = vttToSrt(result.vtt);
     res.json({ filename: `${u.name.replace(/\.[^.]+$/, '')}.${config.lang || 'nld'}.srt`, srt, cues: result.cues, missed: result.missed || 0 });
   } catch (e) {
@@ -968,6 +979,8 @@ function buildSubtitleTracks({ rankedEn, rankedTarget, targetName, iso3, mkUrl }
 app.get(/\/subtitles\//, async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');          // the menu changes (⚡, new uploads): never let an app or proxy reuse an old one
+  const isPreview = String(req.query.preview || '') === '1';   // the install page's Preview button: not counted as "sent to Nuvio"
 
   const m = SUB_PATH_RE.exec(req.path);
   if (!m) return res.json({ subtitles: [] });
@@ -1011,6 +1024,7 @@ app.get(/\/subtitles\//, async (req, res) => {
 
   // Subtitles you uploaded for exactly this title (pinned to the top of the menu).
   for (const up of uploadsFor(fullId)) {
+    if (!isPreview) { up.served = (up.served || 0) + 1; up.lastServedAt = Date.now(); }
     candidateSubs.push({
       source: 'Upload', release: up.name, isHashMatch: false, isEmbedded: false, machine: false,
       score: 0, pinned: true, ready: up.status === 'ready' && up.mode === 'translate', lang: up.mode === 'native' ? L.iso3 : 'eng', url: `upload://${up.id}`
@@ -1072,7 +1086,7 @@ app.get(/\/subtitles\//, async (req, res) => {
   if (pinnedHere) console.log(`[AISUBS] Menu for ${fullId}: ${pinnedHere} uploaded subtitle(s) pinned on top.`);
   else if (near.length) console.log(`[AISUBS] Menu for ${fullId}: no upload matches, but you have uploads for ${near.join(', ')} of this title.`);
   else if (otherId.length) console.log(`[AISUBS] Menu for ${fullId}: no upload matches. Your upload for ${otherId.join(', ')} uses a DIFFERENT IMDb id than the app (${imdbId}).`);
-  return res.json({ subtitles: out, cacheMaxAge: 10 });
+  return res.json({ subtitles: out, cacheMaxAge: 1 });
 });
 
 // ----------------------------------------------------
@@ -2023,6 +2037,7 @@ app.get('/sub.vtt', async (req, res) => {
   const cacheKey = vttCacheKey(config, candidates, id, raw);
   if (subCache.has(cacheKey)) {
     const cached = subCache.get(cacheKey);
+    if (isUpload) markUploadReady(candidates[0]);
     if (isAi && BURST_WINDOW_MS > 0) noteBurst(titleKey, cacheKey, Promise.resolve({ vtt: cached }), false);
     return res.send(cached);
   }
@@ -2057,7 +2072,7 @@ app.get('/sub.vtt', async (req, res) => {
       job.finally(() => { inflight.delete(cacheKey); if (rec) rec.running = false; }).catch(() => {});
     }
     const { vtt, cacheable } = await job;
-    if (cacheable) { setInCache(cacheKey, vtt); if (!isUpload) upstashSaveVtt(cacheKey, vtt, isAi); }
+    if (cacheable) { setInCache(cacheKey, vtt); if (isUpload) markUploadReady(candidates[0]); if (!isUpload) upstashSaveVtt(cacheKey, vtt, isAi); }
     else failCache.set(cacheKey, { vtt, until: Date.now() + 120000 });   // retry allowed after 2 min
     res.send(vtt);
   } catch (err) {

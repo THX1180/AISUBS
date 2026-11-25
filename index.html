@@ -303,7 +303,7 @@
       <div class="actions" style="margin-top:1rem;">
         <button type="button" id="upBtn" class="btn btn-primary">⬆ Upload</button>
       </div>
-      <div id="upStatus" class="helper" style="margin-top:0.75rem;"></div>
+      <div id="upStatus" class="helper" style="margin-top:0.75rem;white-space:pre-line;"></div>
       <div id="upList" style="margin-top:1rem;"></div>
     </div>
 
@@ -837,6 +837,12 @@
           const st = document.createElement('div'); st.className = 'up-meta'; st.textContent = sl[0];
           if (sl[1] === 'ok') st.style.color = 'var(--ok)'; if (sl[1] === 'bad') st.style.color = 'var(--err)';
           row.appendChild(st);
+          const sv = document.createElement('div'); sv.className = 'up-meta';
+          if (u.lastServedAt) {
+            const ago = Math.max(0, Math.round(((data.now || Date.now()) - u.lastServedAt) / 1000));
+            sv.textContent = 'Last sent to Nuvio ' + (ago < 60 ? ago + ' sec' : ago < 3600 ? Math.round(ago / 60) + ' min' : Math.round(ago / 3600) + ' h') + ' ago.';
+          } else sv.textContent = 'Not sent to Nuvio yet (open the title in Nuvio).';
+          row.appendChild(sv);
           if (u.status === 'translating') busy = true;
           const act = document.createElement('div'); act.className = 'up-actions';
           if (u.mode === 'translate') {
@@ -845,10 +851,14 @@
             dl.addEventListener('click', function () { translateAndDownload(u, dl); });
             act.appendChild(dl);
           }
+          const pv = document.createElement('button'); pv.type = 'button'; pv.className = 'btn btn-secondary btn-sm';
+          pv.textContent = '\uD83D\uDD0D Preview menu';
+          pv.addEventListener('click', function () { previewMenu(u, pv); });
+          act.appendChild(pv);
           const del = document.createElement('button'); del.type = 'button'; del.className = 'btn btn-secondary btn-sm btn-danger';
           del.textContent = 'Delete';
           del.addEventListener('click', async function () {
-            try { await api('/api/uploads/' + encodeURIComponent(u.id), { method: 'DELETE' }); msg('Deleted.'); refresh(); }
+            try { await api('/api/uploads/' + encodeURIComponent(u.id), { method: 'DELETE' }); msg('Deleted. Its entry is gone from the Nuvio menu too (a translated copy is not kept).'); refresh(); }
             catch (e) { msg(e.message, true); }
           });
           act.appendChild(del);
@@ -856,6 +866,17 @@
           upList.appendChild(row);
         });
         if (busy) pollTimer = setTimeout(refresh, 4000);          // keep checking while something is translating
+      }
+
+      async function previewMenu(u, btn) {
+        btn.disabled = true;
+        try {
+          const id = u.imdb + (u.season ? ':' + u.season + ':' + u.episode : '');
+          const data = await api('/' + configB64() + '/subtitles/' + (u.season ? 'series' : 'movie') + '/' + encodeURIComponent(id) + '.json?preview=1');
+          const tracks = (data.subtitles || []).slice(0, 4).map(function (t) { return '\u2022 ' + (t.id || t.lang); });
+          msg('Menu Nuvio would get now (top ' + tracks.length + '):\n' + (tracks.join('\n') || 'nothing'));
+        } catch (e) { msg('Preview failed: ' + e.message, true); }
+        btn.disabled = false;
       }
 
       async function translateAndDownload(u, btn) {
@@ -870,6 +891,7 @@
           a.href = URL.createObjectURL(blob); a.download = data.filename;
           document.body.appendChild(a); a.click(); a.remove();
           setTimeout(function () { URL.revokeObjectURL(a.href); }, 10000);
+          refresh();
           msg('Done: ' + data.filename + ' (' + data.cues + ' lines' + (data.missed ? ', ' + data.missed + ' left untranslated' : '') + ').');
         } catch (e) { msg('Translation failed: ' + e.message, true); }
         btn.disabled = false;
