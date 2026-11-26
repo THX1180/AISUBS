@@ -307,6 +307,45 @@
       <div id="upList" style="margin-top:1rem;"></div>
     </div>
 
+    <!-- Transcribe from a link (your own PC) -->
+    <div class="glass-card" style="margin-top: 1.25rem;">
+      <h2 class="section-title" style="margin-top:0;padding-top:0;border-top:0;">Transcribe from a link (your PC)</h2>
+      <p class="section-desc">No subtitles for an episode? Paste a direct video link and your own PC listens to it with Whisper and sends the subtitles here. It needs the AISUBS helper running on your PC. The video never goes through this server.</p>
+      <div id="jobWorker" class="helper" style="margin-bottom:0.75rem;"></div>
+      <div class="form-group">
+        <label for="jobLink">Direct video link (for example from Offcloud)</label>
+        <input type="text" id="jobLink" placeholder="https://..." autocomplete="off" autocapitalize="off" spellcheck="false">
+        <span class="helper">The link is only kept in memory until your PC has picked it up, and it is never shown again or written to the log.</span>
+      </div>
+      <div class="form-group">
+        <label for="jobRecent">Easiest: pick a title you just opened in Nuvio</label>
+        <div class="select-wrapper">
+          <select id="jobRecent"><option value="">Open the title in Nuvio first, then tap here</option></select>
+        </div>
+      </div>
+      <div class="form-group">
+        <label for="jobImdb">IMDb id</label>
+        <input type="text" id="jobImdb" placeholder="tt1234567" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <span class="helper">Use the id of the SERIES, not of a single episode.</span>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label for="jobSeason">Season</label>
+          <input type="number" id="jobSeason" min="1" inputmode="numeric" placeholder="series only">
+        </div>
+        <div class="form-group">
+          <label for="jobEpisode">Episode</label>
+          <input type="number" id="jobEpisode" min="1" inputmode="numeric" placeholder="series only">
+        </div>
+      </div>
+      <span class="helper" style="margin-top:-0.4rem;margin-bottom:1rem;">Leave season and episode empty for a movie. The audio is assumed to be English.</span>
+      <div class="actions" style="margin-top:1rem;">
+        <button type="button" id="jobBtn" class="btn btn-primary">&#128640; Send to my PC</button>
+      </div>
+      <div id="jobStatus" class="helper" style="margin-top:0.75rem;white-space:pre-line;"></div>
+      <div id="jobList" style="margin-top:1rem;"></div>
+    </div>
+
     <!-- QR Code Modal -->
     <div id="qrModal" class="modal hidden">
       <div class="modal-card">
@@ -940,6 +979,113 @@
       refresh();
       loadRecent();
     })();
+    // ---- Transcribe from a link (your PC) --------------------------------------------------------------
+    (function () {
+      const $ = function (id) { return document.getElementById(id); };
+      const jobLink = $('jobLink'), jobImdb = $('jobImdb'), jobSeason = $('jobSeason'), jobEpisode = $('jobEpisode');
+      const jobRecent = $('jobRecent'), jobBtn = $('jobBtn'), jobStatus = $('jobStatus'), jobList = $('jobList'), jobWorker = $('jobWorker');
+      if (!jobBtn) return;
+      let timer = null, recent = [];
+
+      function msg(text, bad) { jobStatus.textContent = text; jobStatus.style.color = bad ? 'var(--err)' : 'var(--muted)'; }
+      async function call(path, opts) {
+        const res = await fetch(TOKEN_PREFIX + path, opts);
+        const data = await res.json().catch(function () { return {}; });
+        if (!res.ok) throw new Error(data.error || ('Server said HTTP ' + res.status));
+        return data;
+      }
+      function ago(ms) {
+        const s = Math.max(0, Math.round(ms / 1000));
+        return s < 60 ? s + ' sec' : s < 3600 ? Math.round(s / 60) + ' min' : Math.round(s / 3600) + ' h';
+      }
+      function label(j) {
+        return j.imdb + (j.season ? ' S' + String(j.season).padStart(2, '0') + 'E' + String(j.episode).padStart(2, '0') : ' (movie)') + (j.host ? ' \u00B7 ' + j.host : '');
+      }
+
+      async function loadRecent() {
+        try {
+          const data = await call('/api/recent-titles');
+          recent = data.titles || [];
+          jobRecent.textContent = '';
+          const first = document.createElement('option'); first.value = '';
+          first.textContent = recent.length ? 'Choose a title...' : 'Open the title in Nuvio first, then tap here';
+          jobRecent.appendChild(first);
+          recent.forEach(function (t, i) {
+            const o = document.createElement('option'); o.value = String(i);
+            o.textContent = t.imdb + (t.season ? ' S' + String(t.season).padStart(2, '0') + 'E' + String(t.episode).padStart(2, '0') : ' (movie)') + (t.file ? ' - ' + t.file.slice(0, 40) : '');
+            jobRecent.appendChild(o);
+          });
+        } catch (e) { /* the page is not on the /k-TOKEN address: nothing to load */ }
+      }
+      jobRecent.addEventListener('focus', loadRecent);
+      jobRecent.addEventListener('change', function () {
+        const t = recent[Number(jobRecent.value)];
+        if (!t) return;
+        jobImdb.value = t.imdb; jobSeason.value = t.season || ''; jobEpisode.value = t.episode || '';
+      });
+
+      function describe(j, workerOnline) {
+        if (j.status === 'queued') return [workerOnline ? '\u23F3 Waiting for your PC to pick it up...' : '\u23F3 Waiting. The helper is not running: open "AISUBS helper" on your PC.', ''];
+        if (j.status === 'working') return ['\u2699\uFE0F ' + (j.message || 'Working...'), ''];
+        if (j.status === 'done') return ['\u2705 ' + (j.message || 'Done.') + ' It is pinned at the top in Nuvio and translates when you play it.', 'ok'];
+        if (j.status === 'failed') return ['\u274C ' + (j.message || 'It failed.'), 'bad'];
+        return ['Cancelled.', ''];
+      }
+
+      async function refresh() {
+        clearTimeout(timer);
+        let data;
+        try { data = await call('/api/jobs'); }
+        catch (e) { jobList.textContent = ''; jobWorker.textContent = 'Open this page from your /k-YOURTOKEN address to use this.'; return; }
+        const online = data.workerSeenAt && (data.now - data.workerSeenAt) < 30000;
+        jobWorker.textContent = online ? '\uD83D\uDFE2 PC helper is online.' :
+          data.workerSeenAt ? '\u26AA PC helper last seen ' + ago(data.now - data.workerSeenAt) + ' ago. Open "AISUBS helper" on your PC.' :
+          '\u26AA PC helper has not checked in yet. Open "AISUBS helper" on your PC.';
+        jobList.textContent = '';
+        let busy = false;
+        data.jobs.forEach(function (j) {
+          const row = document.createElement('div'); row.className = 'up-item';
+          const title = document.createElement('div'); title.className = 'up-name'; title.textContent = label(j);
+          row.appendChild(title);
+          const d = describe(j, online);
+          const st = document.createElement('div'); st.className = 'up-meta'; st.textContent = d[0];
+          if (d[1] === 'ok') st.style.color = 'var(--ok)'; else if (d[1] === 'bad') st.style.color = 'var(--err)';
+          row.appendChild(st);
+          const act = document.createElement('div'); act.className = 'up-actions';
+          const del = document.createElement('button'); del.type = 'button'; del.className = 'btn btn-secondary btn-sm btn-danger';
+          del.textContent = (j.status === 'queued' || j.status === 'working') ? 'Cancel' : 'Remove';
+          del.addEventListener('click', async function () {
+            del.disabled = true;
+            try { await call('/api/jobs/' + j.id, { method: 'DELETE' }); } catch (e) { msg(e.message, true); }
+            refresh();
+          });
+          act.appendChild(del); row.appendChild(act);
+          jobList.appendChild(row);
+          if (j.status === 'queued' || j.status === 'working') busy = true;
+        });
+        if (busy) timer = setTimeout(refresh, 4000);
+      }
+
+      jobBtn.addEventListener('click', async function () {
+        const link = jobLink.value.trim();
+        if (!/^https?:\/\/\S{4,}$/i.test(link)) return msg('Paste a direct link that starts with https://', true);
+        if (!/^tt\d{5,10}$/i.test(jobImdb.value.trim())) return msg('The IMDb id should look like tt1234567.', true);
+        const s = jobSeason.value.trim(), e = jobEpisode.value.trim();
+        if (!!s !== !!e) return msg('Fill in both season and episode for a series, or leave both empty for a movie.', true);
+        jobBtn.disabled = true; msg('Sending...');
+        try {
+          await call('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ link: link, imdb: jobImdb.value.trim(), season: s, episode: e }) });
+          jobLink.value = '';
+          msg('Queued. Your PC picks it up within a few seconds if the helper is running.');
+        } catch (err) { msg(err.message, true); }
+        jobBtn.disabled = false;
+        refresh();
+      });
+
+      refresh();
+    })();
+
   </script>
 </body>
 </html>

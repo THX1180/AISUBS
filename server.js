@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { getManifest } from './manifest.js';
 
-const BUILD = '2026-11-24-sync';   // shown in the log and on the status page, to confirm which version is deployed
+const BUILD = '2026-11-27-jobs';   // shown in the log and on the status page, to confirm which version is deployed
 console.log(`[AISUBS] Build ${BUILD}`);
 const app = express();
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -228,6 +228,98 @@ app.post('/api/uploads', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// >>> JOBS
+// ---- Transcription jobs for your own PC ---------------------------------------------------------------
+// The page queues a job (a link + which title). The helper on your PC asks "any jobs?", downloads the link itself,
+// runs Whisper and sends the finished subtitle through /api/uploads. This server never downloads or stores the video.
+// Jobs live in memory only (a restart clears them). Every route here sits behind the /k-TOKEN gate.
+const jobs = new Map();
+const MAX_JOBS = 20;
+const JOB_STALE_MS = 5 * 60 * 1000;            // a job being worked on with no news for 5 minutes counts as failed
+const JOB_QUEUE_EXPIRY_MS = 24 * 3600 * 1000;  // a job nobody picked up within a day is dropped
+let workerSeenAt = 0;                          // when the PC helper last asked for work
+
+function sweepJobs(now = Date.now()) {
+  for (const [id, j] of jobs) {
+    if (j.status === 'working' && now - j.updatedAt > JOB_STALE_MS) {
+      j.status = 'failed'; j.message = 'The PC helper stopped responding.'; j.updatedAt = now;
+    }
+    if (j.status === 'queued' && now - j.createdAt > JOB_QUEUE_EXPIRY_MS) jobs.delete(id);
+  }
+}
+function cleanJobText(t) { return String(t || '').replace(/https?:\/\/\S+/gi, '[link]').replace(/[\r\n]+/g, ' ').trim().slice(0, 200); }
+function jobHost(link) { try { return new URL(link).hostname; } catch (e) { return ''; } }   // the page never gets the full link back
+function jobView(j) {
+  return { id: j.id, status: j.status, message: j.message, imdb: j.imdb, season: j.season, episode: j.episode,
+    host: jobHost(j.link), createdAt: j.createdAt, updatedAt: j.updatedAt, cues: j.cues || null };
+}
+
+app.post('/api/jobs', (req, res) => {
+  const { link, imdb, season, episode } = req.body || {};
+  const url = String(link || '').trim();
+  if (!/^https?:\/\/[^\s]{4,2000}$/i.test(url) || !jobHost(url)) return res.status(400).json({ error: 'Paste a direct link that starts with https://' });
+  const tt = String(imdb || '').trim().toLowerCase();
+  if (!/^tt\d{5,10}$/.test(tt)) return res.status(400).json({ error: 'The IMDb id should look like tt1234567.' });
+  const S = season ? Number(season) : null, E = episode ? Number(episode) : null;
+  if (!!S !== !!E) return res.status(400).json({ error: 'Fill in both season and episode for a series, or leave both empty for a movie.' });
+  if (S && (!Number.isInteger(S) || S < 1 || S > 99 || !Number.isInteger(E) || E < 1 || E > 999)) {
+    return res.status(400).json({ error: 'Season and episode must be whole numbers.' });
+  }
+  sweepJobs();
+  if (jobs.size >= MAX_JOBS) {
+    const old = [...jobs.values()].find(j => ['done', 'failed', 'cancelled'].includes(j.status));
+    if (!old) return res.status(400).json({ error: 'Too many jobs are waiting. Cancel one first.' });
+    jobs.delete(old.id);
+  }
+  const now = Date.now();
+  const j = { id: crypto.randomBytes(6).toString('hex'), link: url, imdb: tt, season: S, episode: E,
+    status: 'queued', message: '', createdAt: now, updatedAt: now, cancelled: false, cues: null };
+  jobs.set(j.id, j);
+  console.log(`[AISUBS] Transcription job queued for ${tt}${S ? ` S${S}E${E}` : ''} (${jobHost(url)}).`);   // never log the link itself
+  res.json({ id: j.id });
+});
+
+app.get('/api/jobs', (req, res) => {
+  sweepJobs();
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ now: Date.now(), workerSeenAt: workerSeenAt || null, jobs: [...jobs.values()].reverse().map(jobView) });
+});
+
+// The PC helper calls this every few seconds. One job at a time: nothing is handed out while another is being worked on.
+app.post('/api/jobs/claim', (req, res) => {
+  workerSeenAt = Date.now();
+  sweepJobs();
+  res.setHeader('Cache-Control', 'no-store');
+  const all = [...jobs.values()];
+  if (all.some(j => j.status === 'working')) return res.json({ job: null });
+  const j = all.find(x => x.status === 'queued');          // oldest first (Map keeps insertion order)
+  if (!j) return res.json({ job: null });
+  j.status = 'working'; j.message = 'Picked up by your PC.'; j.updatedAt = Date.now();
+  res.json({ job: { id: j.id, link: j.link, imdb: j.imdb, season: j.season, episode: j.episode } });
+});
+
+app.post('/api/jobs/:id/progress', (req, res) => {
+  workerSeenAt = Date.now();
+  const j = jobs.get(req.params.id);
+  if (!j) return res.status(404).json({ error: 'No such job.' });
+  if (j.cancelled) return res.json({ cancelled: true });
+  if (j.status !== 'working') return res.json({ ok: true });
+  const { status, message, cues } = req.body || {};
+  if (!['working', 'done', 'failed'].includes(status)) return res.status(400).json({ error: 'Bad status.' });
+  j.status = status; j.message = cleanJobText(message) || j.message; j.updatedAt = Date.now();
+  if (status === 'done' && Number.isFinite(Number(cues))) j.cues = Number(cues);
+  res.json({ ok: true });
+});
+
+app.delete('/api/jobs/:id', (req, res) => {
+  const j = jobs.get(req.params.id);
+  if (!j) return res.json({ ok: true });
+  if (j.status === 'working') { j.cancelled = true; j.status = 'cancelled'; j.message = 'Cancelled.'; j.updatedAt = Date.now(); }   // the helper notices and stops
+  else jobs.delete(j.id);
+  res.json({ ok: true });
+});
+// <<< JOBS
 
 app.get('/api/recent-titles', (req, res) => res.json({ titles: recentTitles().slice(0, 12) }));
 
