@@ -252,7 +252,7 @@
     <!-- Upload a subtitle -->
     <div class="glass-card" style="margin-top: 1.25rem;">
       <h2 class="section-title" style="margin-top:0;padding-top:0;border-top:0;">Upload a subtitle</h2>
-      <p class="section-desc">Have your own subtitle file? Upload it for a title and it shows up at the top of that title's list in Nuvio. Uploads are kept until the server restarts (newest 20).</p>
+      <p class="section-desc">Have your own subtitle file? Upload it for a title and it shows up at the top of that title's list in Nuvio. The newest 20 are kept. With the Upstash box switched on (see the status page) they survive restarts for a while; without it they are lost when the server restarts.</p>
 
       <div class="form-group">
         <label for="upFile">Subtitle file (.srt, .vtt, .ass, .ssa or a .zip, max 2 MB)</label>
@@ -339,6 +339,28 @@
         </div>
       </div>
       <span class="helper" style="margin-top:-0.4rem;margin-bottom:1rem;">Leave season and episode empty for a movie. The audio is assumed to be English.</span>
+      <div class="form-group">
+        <label for="jobModel">Whisper model</label>
+        <div class="select-wrapper">
+          <select id="jobModel">
+            <option value="">Helper's choice (what is set on your PC)</option>
+            <option value="small">Small: fastest, good enough for clear speech</option>
+            <option value="medium">Medium: slower, fewer mistakes</option>
+            <option value="large-v3-turbo">Large v3 turbo: most accurate, slowest (needs the most memory)</option>
+          </select>
+        </div>
+        <span class="helper">A model that is not on your PC yet is downloaded by the helper the first time (small about 0.5 GB, medium about 1.5 GB, large turbo about 1.6 GB).</span>
+      </div>
+      <div class="form-group checkbox-group">
+        <label class="custom-switch">
+          <input type="checkbox" id="jobReduce" checked>
+          <span class="slider"></span>
+        </label>
+        <div class="switch-meta">
+          <span class="switch-title">Fewer made-up lines</span>
+          <span class="helper">Skips silence and music and removes repeated or invented lines. Switch off if real speech goes missing.</span>
+        </div>
+      </div>
       <div class="actions" style="margin-top:1rem;">
         <button type="button" id="jobBtn" class="btn btn-primary">&#128640; Send to my PC</button>
       </div>
@@ -983,7 +1005,7 @@
     (function () {
       const $ = function (id) { return document.getElementById(id); };
       const jobLink = $('jobLink'), jobImdb = $('jobImdb'), jobSeason = $('jobSeason'), jobEpisode = $('jobEpisode');
-      const jobRecent = $('jobRecent'), jobBtn = $('jobBtn'), jobStatus = $('jobStatus'), jobList = $('jobList'), jobWorker = $('jobWorker');
+      const jobModel = $('jobModel'), jobReduce = $('jobReduce'), jobRecent = $('jobRecent'), jobBtn = $('jobBtn'), jobStatus = $('jobStatus'), jobList = $('jobList'), jobWorker = $('jobWorker');
       if (!jobBtn) return;
       let timer = null, recent = [];
 
@@ -999,7 +1021,7 @@
         return s < 60 ? s + ' sec' : s < 3600 ? Math.round(s / 60) + ' min' : Math.round(s / 3600) + ' h';
       }
       function label(j) {
-        return j.imdb + (j.season ? ' S' + String(j.season).padStart(2, '0') + 'E' + String(j.episode).padStart(2, '0') : ' (movie)') + (j.host ? ' \u00B7 ' + j.host : '');
+        return j.imdb + (j.season ? ' S' + String(j.season).padStart(2, '0') + 'E' + String(j.episode).padStart(2, '0') : ' (movie)') + (j.host ? ' \u00B7 ' + j.host : '') + (j.model ? ' \u00B7 ' + j.model : '');
       }
 
       async function loadRecent() {
@@ -1075,7 +1097,7 @@
         jobBtn.disabled = true; msg('Sending...');
         try {
           await call('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ link: link, imdb: jobImdb.value.trim(), season: s, episode: e }) });
+            body: JSON.stringify({ link: link, imdb: jobImdb.value.trim(), season: s, episode: e, model: jobModel.value, reduce: !!jobReduce.checked }) });
           jobLink.value = '';
           msg('Queued. Your PC picks it up within a few seconds if the helper is running.');
         } catch (err) { msg(err.message, true); }

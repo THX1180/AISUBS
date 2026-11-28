@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { getManifest } from './manifest.js';
 
-const BUILD = '2026-11-27-jobs';   // shown in the log and on the status page, to confirm which version is deployed
+const BUILD = '2026-11-28-model';   // shown in the log and on the status page, to confirm which version is deployed
 console.log(`[AISUBS] Build ${BUILD}`);
 const app = express();
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -89,6 +89,53 @@ const MAX_UPLOAD_BYTES = 2 * 1024 * 1024;
 const uploadKey = (u) => (u.season ? `${u.imdb}:${u.season}:${u.episode}` : u.imdb);
 const uploadsFor = (fullId) => [...uploads.values()].filter(u => uploadKey(u) === String(fullId).toLowerCase()).sort((a, b) => b.createdAt - a.createdAt);
 
+// With Upstash switched on, uploads are also saved there (same TTL as saved translations), so they survive a restart under the
+// SAME id. That keeps the ready state (⚡) honest: the translation is saved under a key that contains that id.
+const UPL_PREFIX = 'aisubs:upl:v1:';
+const UPL_INDEX = 'aisubs:upl:idx:v1';
+const UPL_MAX_PACKED = 900 * 1024;                 // Upstash refuses requests of about 1 MB: bigger uploads simply stay memory-only
+const UPL_ID_RE = /^[a-f0-9]{12}$/;
+function persistUpload(rec) {                      // fire and forget
+  if (!UPSTASH_ON || !rec || !UPL_ID_RE.test(rec.id)) return;
+  const meta = { id: rec.id, name: rec.name, title: rec.title, imdb: rec.imdb, season: rec.season, episode: rec.episode, mode: rec.mode,
+    cues: rec.cues, createdAt: rec.createdAt, status: ['ready', 'failed'].includes(rec.status) ? rec.status : 'manual', error: rec.error || null,
+    data: rec.bytes.toString('base64') };
+  const packed = zlib.gzipSync(Buffer.from(JSON.stringify(meta), 'utf-8')).toString('base64');
+  if (packed.length > UPL_MAX_PACKED) { console.log(`[AISUBS] Upload ${rec.id} is too big to save in Upstash: it stays in memory only.`); return; }
+  upstashCall('/pipeline', [['SET', UPL_PREFIX + rec.id, packed, 'EX', UPSTASH_TTL_SEC], ['SADD', UPL_INDEX, rec.id], ['EXPIRE', UPL_INDEX, UPSTASH_TTL_SEC]], 8000)
+    .catch(() => {});
+}
+function forgetUpload(id) {                        // the one place an upload is removed: memory and Upstash together
+  const had = uploads.delete(id);
+  if (UPSTASH_ON && UPL_ID_RE.test(String(id))) upstashCall('/pipeline', [['DEL', UPL_PREFIX + id], ['SREM', UPL_INDEX, id]]).catch(() => {});
+  return had;
+}
+async function loadUploadsFromUpstash() {
+  const idx = await upstashCall('', ['SMEMBERS', UPL_INDEX], 8000);
+  const ids = Array.isArray(idx?.result) ? idx.result.filter(id => UPL_ID_RE.test(String(id))) : [];
+  if (!ids.length) return 0;
+  const got = await upstashCall('/pipeline', ids.map(id => ['GET', UPL_PREFIX + id]), 15000);
+  if (!Array.isArray(got)) return 0;
+  const recs = [], dead = [];
+  ids.forEach((id, i) => {
+    const raw = got[i]?.result;
+    if (!raw) { dead.push(id); return; }                       // expired: tidy the index
+    try {
+      const m = JSON.parse(zlib.gunzipSync(Buffer.from(String(raw), 'base64')).toString('utf-8'));
+      const bytes = Buffer.from(String(m.data || ''), 'base64');
+      if (m.id !== id || !/^tt\d{5,10}$/.test(m.imdb) || !['translate', 'native'].includes(m.mode) || !bytes.length || bytes.length > MAX_UPLOAD_BYTES) throw new Error('bad record');
+      recs.push({ id, name: String(m.name || 'subtitle').slice(0, 120), title: m.title || null, imdb: m.imdb, season: m.season || null, episode: m.episode || null,
+        mode: m.mode, bytes, cues: Number(m.cues) || 0, createdAt: Number(m.createdAt) || Date.now(),
+        status: m.mode === 'native' ? 'ready' : (['ready', 'failed'].includes(m.status) ? m.status : 'manual'), error: m.status === 'failed' ? (m.error || null) : null });
+    } catch (e) { dead.push(id); }
+  });
+  if (dead.length) upstashCall('/pipeline', [['SREM', UPL_INDEX, ...dead]]).catch(() => {});
+  recs.sort((a, b) => a.createdAt - b.createdAt);
+  let n = 0;
+  for (const r of recs.slice(-MAX_UPLOADS)) if (!uploads.has(r.id)) { uploads.set(r.id, r); n++; }
+  return n;
+}
+
 function vttToSrt(vtt) {
   const out = [];
   let n = 1;
@@ -122,10 +169,14 @@ async function lookupTitle(tt) {
 }
 
 // An upload counts as "ready" (⚡) after any successful translation: the Download button, Nuvio playing it, or a cache hit.
-function markUploadReady(url) {
+function markUploadReady(url, save = true) {
   const m = /^upload:\/\/(.+)$/.exec(String(url || ''));
   const u = m && uploads.get(m[1]);
-  if (u && u.mode === 'translate' && u.status !== 'translating') { u.status = 'ready'; u.error = null; }
+  if (u && u.mode === 'translate' && u.status !== 'translating') {
+    const changed = u.status !== 'ready';
+    u.status = 'ready'; u.error = null;
+    if (changed && save) persistUpload(u);       // the Download button passes save=false: that translation is not kept in Upstash
+  }
 }
 
 // Translates a fresh upload in the background, so it is already done (⚡) when you open the title in Nuvio.
@@ -146,11 +197,14 @@ async function pretranslateUpload(rec, config) {
     const { vtt, cacheable } = await job;
     if (cacheable) {
       setInCache(cacheKey, vtt);
+      upstashSaveVtt(cacheKey, vtt, true);
       rec.status = 'ready';
+      if (uploads.get(rec.id) === rec) persistUpload(rec);
       console.log(`[AISUBS] Uploaded subtitle for ${id} is translated and ready.`);
     } else {
       rec.status = 'failed';
       rec.error = ((/Translation failed[^\n]*/.exec(vtt) || [])[0] || 'The translation did not complete (rate limit or an API problem).').slice(0, 200);
+      if (uploads.get(rec.id) === rec) persistUpload(rec);
     }
   } catch (e) {
     rec.status = 'failed';
@@ -212,9 +266,9 @@ app.post('/api/uploads', async (req, res) => {
       id: crypto.randomBytes(6).toString('hex'), name: cleanName, title: info ? info.name : null, imdb: tt, season: S, episode: E,
       mode, bytes, cues: cues.length, createdAt: Date.now(), status: 'manual', error: null
     };
-    for (const [k, u] of uploads) if (uploadKey(u) === uploadKey(rec) && u.mode === mode) uploads.delete(k);   // newer replaces older
+    for (const [k, u] of [...uploads]) if (uploadKey(u) === uploadKey(rec) && u.mode === mode) forgetUpload(k);   // newer replaces older
     uploads.set(rec.id, rec);
-    while (uploads.size > MAX_UPLOADS) uploads.delete(uploads.keys().next().value);
+    while (uploads.size > MAX_UPLOADS) forgetUpload(uploads.keys().next().value);
     console.log(`[AISUBS] Subtitle uploaded for ${uploadKey(rec)}${rec.title ? ` (${rec.title})` : ''}: ${mode}, ${cues.length} lines.`);
 
     if (mode === 'native') {
@@ -223,6 +277,7 @@ app.post('/api/uploads', async (req, res) => {
       const config = parseConfig(String(cfg || ''));
       if ((config.apiKey || ENV_GEMINI_KEY) && config.provider !== 'free') pretranslateUpload(rec, config);   // runs in the background
     }
+    persistUpload(rec);
     res.json({ id: rec.id, name: rec.name, title: rec.title, cues: rec.cues, status: rec.status });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -236,6 +291,7 @@ app.post('/api/uploads', async (req, res) => {
 // Jobs live in memory only (a restart clears them). Every route here sits behind the /k-TOKEN gate.
 const jobs = new Map();
 const MAX_JOBS = 20;
+const JOB_MODELS = ['small', 'medium', 'large-v3-turbo'];   // whitelist: the helper only ever gets one of these names
 const JOB_STALE_MS = 5 * 60 * 1000;            // a job being worked on with no news for 5 minutes counts as failed
 const JOB_QUEUE_EXPIRY_MS = 24 * 3600 * 1000;  // a job nobody picked up within a day is dropped
 let workerSeenAt = 0;                          // when the PC helper last asked for work
@@ -252,11 +308,13 @@ function cleanJobText(t) { return String(t || '').replace(/https?:\/\/\S+/gi, '[
 function jobHost(link) { try { return new URL(link).hostname; } catch (e) { return ''; } }   // the page never gets the full link back
 function jobView(j) {
   return { id: j.id, status: j.status, message: j.message, imdb: j.imdb, season: j.season, episode: j.episode,
-    host: jobHost(j.link), createdAt: j.createdAt, updatedAt: j.updatedAt, cues: j.cues || null };
+    host: jobHost(j.link), model: j.model || null, reduce: j.reduce !== false, createdAt: j.createdAt, updatedAt: j.updatedAt, cues: j.cues || null };
 }
 
 app.post('/api/jobs', (req, res) => {
   const { link, imdb, season, episode } = req.body || {};
+  const model = JOB_MODELS.includes(String(req.body?.model || '')) ? String(req.body.model) : null;   // null = the helper's own choice
+  const reduce = req.body?.reduce !== false;
   const url = String(link || '').trim();
   if (!/^https?:\/\/[^\s]{4,2000}$/i.test(url) || !jobHost(url)) return res.status(400).json({ error: 'Paste a direct link that starts with https://' });
   const tt = String(imdb || '').trim().toLowerCase();
@@ -273,7 +331,7 @@ app.post('/api/jobs', (req, res) => {
     jobs.delete(old.id);
   }
   const now = Date.now();
-  const j = { id: crypto.randomBytes(6).toString('hex'), link: url, imdb: tt, season: S, episode: E,
+  const j = { id: crypto.randomBytes(6).toString('hex'), link: url, imdb: tt, season: S, episode: E, model, reduce,
     status: 'queued', message: '', createdAt: now, updatedAt: now, cancelled: false, cues: null };
   jobs.set(j.id, j);
   console.log(`[AISUBS] Transcription job queued for ${tt}${S ? ` S${S}E${E}` : ''} (${jobHost(url)}).`);   // never log the link itself
@@ -296,7 +354,7 @@ app.post('/api/jobs/claim', (req, res) => {
   const j = all.find(x => x.status === 'queued');          // oldest first (Map keeps insertion order)
   if (!j) return res.json({ job: null });
   j.status = 'working'; j.message = 'Picked up by your PC.'; j.updatedAt = Date.now();
-  res.json({ job: { id: j.id, link: j.link, imdb: j.imdb, season: j.season, episode: j.episode } });
+  res.json({ job: { id: j.id, link: j.link, imdb: j.imdb, season: j.season, episode: j.episode, model: j.model || null, reduce: j.reduce !== false } });
 });
 
 app.post('/api/jobs/:id/progress', (req, res) => {
@@ -335,7 +393,7 @@ app.get('/api/uploads', (req, res) => {
 });
 
 app.delete('/api/uploads/:id', (req, res) => {
-  res.json({ deleted: uploads.delete(req.params.id) });
+  res.json({ deleted: forgetUpload(req.params.id) });
 });
 
 // Translate an upload now and hand back an .srt to keep (costs the same as translating it in Nuvio).
@@ -351,7 +409,7 @@ app.post('/api/uploads/:id/translate', async (req, res) => {
     if (!result.cacheable) {
       return res.status(502).json({ error: 'The translation did not complete (rate limit or an API problem). Check the status page, then try again.' });
     }
-    markUploadReady(`upload://${u.id}`);
+    markUploadReady(`upload://${u.id}`, false);
     const srt = vttToSrt(result.vtt);
     res.json({ filename: `${u.name.replace(/\.[^.]+$/, '')}.${config.lang || 'nld'}.srt`, srt, cues: result.cues, missed: result.missed || 0 });
   } catch (e) {
@@ -434,7 +492,7 @@ function render(d){
     if(sg.lastError)kv(stg,'Last problem',sg.lastError,'bad');
   }
   var ups=$('ups');ups.textContent='';
-  if(!d.uploads.length){ups.appendChild(el('div','row muted','No uploads on the server (a restart clears them).'));}
+  if(!d.uploads.length){ups.appendChild(el('div','row muted','No uploads on the server.'));}
   d.uploads.forEach(function(u){var r=el('div','row');r.appendChild(el('div','',u.key));r.appendChild(el('div','m',u.name+' \u00B7 '+(u.mode==='translate'?'to translate':'used as it is')+' \u00B7 '+u.status+' \u00B7 uploaded '+ago(d.now-u.createdAt)));ups.appendChild(r);});
   var mn=$('menus');mn.textContent='';
   if(!d.menus.length){mn.appendChild(el('div','row muted','No menu requested since the last restart.'));}
@@ -1881,14 +1939,14 @@ function onUpstashError(e) {
   }
 }
 
-async function upstashCall(path, body) {
+async function upstashCall(path, body, timeoutMs = 2500) {
   if (!UPSTASH_ON || Date.now() < upstashState.pausedUntil) return null;
   try {
     const r = await fetch(UPSTASH_URL + path, {
       method: 'POST',
       headers: { Authorization: `Bearer ${UPSTASH_TOKEN}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(2500)
+      signal: AbortSignal.timeout(timeoutMs)
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
@@ -1933,6 +1991,8 @@ if (UPSTASH_ON) {
     upstashState.pingOk = !!j; upstashState.lastPingAt = Date.now();
     console.log(j ? `[AISUBS] Upstash connected - subtitles are kept for ${UPSTASH_TTL_DAYS} days, across restarts.`
                   : '[AISUBS] Upstash is set up but not reachable yet - check the URL and token (see the status page).');
+    if (j) loadUploadsFromUpstash().then(n => { if (n) console.log(`[AISUBS] ${n} uploaded subtitle${n === 1 ? '' : 's'} restored from Upstash.`); })
+      .catch(e => console.warn('[AISUBS] Could not restore uploads:', e.message));
   });
 } else {
   console.log('[AISUBS] Upstash not set up - saved subtitles live in memory only (lost on restart).');
@@ -2122,7 +2182,7 @@ app.get('/sub.vtt', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
 
   const isAi = raw !== 'true';
-  const isUpload = String(candidates[0] || '').startsWith('upload://');   // uploads are memory-only
+  const isUpload = String(candidates[0] || '').startsWith('upload://');
   const titleKey = `${type}|${id}|${config.lang}|${config.provider}|${config.model}|${config.bilingual}|${config.offsetMs}`;
   console.log(`[AISUBS] Track request (${isAi ? 'AI' : 'native'}) from ${String(req.get('user-agent') || '?').slice(0, 70)}`);
 
@@ -2136,7 +2196,7 @@ app.get('/sub.vtt', async (req, res) => {
   const recentFail = failCache.get(cacheKey);
   if (recentFail && recentFail.until > Date.now()) return res.send(recentFail.vtt);
 
-  if (UPSTASH_ON && !isUpload) {              // saved before a restart? load it instead of paying again
+  if (UPSTASH_ON) {                           // saved before a restart? load it instead of paying again
     const saved = await upstashGetVtt(cacheKey);
     if (saved) {
       console.log('[AISUBS] Served a saved subtitle from Upstash (no download, no translation).');
@@ -2164,7 +2224,7 @@ app.get('/sub.vtt', async (req, res) => {
       job.finally(() => { inflight.delete(cacheKey); if (rec) rec.running = false; }).catch(() => {});
     }
     const { vtt, cacheable } = await job;
-    if (cacheable) { setInCache(cacheKey, vtt); if (isUpload) markUploadReady(candidates[0]); if (!isUpload) upstashSaveVtt(cacheKey, vtt, isAi); }
+    if (cacheable) { setInCache(cacheKey, vtt); if (isUpload) markUploadReady(candidates[0]); upstashSaveVtt(cacheKey, vtt, isAi); }
     else failCache.set(cacheKey, { vtt, until: Date.now() + 120000 });   // retry allowed after 2 min
     res.send(vtt);
   } catch (err) {
