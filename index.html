@@ -309,9 +309,19 @@
 
     <!-- Transcribe from a link (your own PC) -->
     <div class="glass-card" style="margin-top: 1.25rem;">
-      <h2 class="section-title" style="margin-top:0;padding-top:0;border-top:0;">Transcribe from a link (your PC)</h2>
-      <p class="section-desc">No subtitles for an episode? Paste a direct video link and your own PC listens to it with Whisper and sends the subtitles here. It needs the AISUBS helper running on your PC. The video never goes through this server.</p>
+      <h2 class="section-title" style="margin-top:0;padding-top:0;border-top:0;">Transcribe or extract from a link (your PC)</h2>
+      <p class="section-desc">No subtitles for an episode? Paste a direct video link and your own PC either listens to it with Whisper, or pulls out the subtitle track that is already inside the video (ASS, SSA or SRT) and sends it here. It needs the AISUBS helper running on your PC. The video never goes through this server.</p>
       <div id="jobWorker" class="helper" style="margin-bottom:0.75rem;"></div>
+      <div class="form-group">
+        <label for="jobKind">What should your PC do?</label>
+        <div class="select-wrapper">
+          <select id="jobKind">
+            <option value="transcribe">Transcribe the speech with Whisper</option>
+            <option value="extract">Extract a subtitle track from the video</option>
+          </select>
+        </div>
+        <span id="jobKindNote" class="helper"></span>
+      </div>
       <div class="form-group">
         <label for="jobLink">Direct video link (for example from Offcloud)</label>
         <input type="text" id="jobLink" placeholder="https://..." autocomplete="off" autocapitalize="off" spellcheck="false">
@@ -338,8 +348,8 @@
           <input type="number" id="jobEpisode" min="1" inputmode="numeric" placeholder="series only">
         </div>
       </div>
-      <span class="helper" style="margin-top:-0.4rem;margin-bottom:1rem;">Leave season and episode empty for a movie. The audio is assumed to be English.</span>
-      <div class="form-group">
+      <span class="helper" id="jobEpNote" style="margin-top:-0.4rem;margin-bottom:1rem;">Leave season and episode empty for a movie. The audio is assumed to be English.</span>
+      <div class="form-group" id="jobModelBox">
         <label for="jobModel">Whisper model</label>
         <div class="select-wrapper">
           <select id="jobModel">
@@ -351,7 +361,7 @@
         </div>
         <span class="helper">A model that is not on your PC yet is downloaded by the helper the first time (small about 0.5 GB, medium about 1.5 GB, large turbo about 1.6 GB).</span>
       </div>
-      <div class="form-group checkbox-group">
+      <div class="form-group checkbox-group" id="jobReduceBox">
         <label class="custom-switch">
           <input type="checkbox" id="jobReduce" checked>
           <span class="slider"></span>
@@ -362,7 +372,7 @@
         </div>
       </div>
       <div class="actions" style="margin-top:1rem;">
-        <button type="button" id="jobBtn" class="btn btn-primary">&#128640; Send to my PC</button>
+        <button type="button" id="jobBtn" class="btn btn-primary">&#128640; <span id="jobBtnText">Send to my PC</span></button>
       </div>
       <div id="jobStatus" class="helper" style="margin-top:0.75rem;white-space:pre-line;"></div>
       <div id="jobList" style="margin-top:1rem;"></div>
@@ -1005,9 +1015,19 @@
     (function () {
       const $ = function (id) { return document.getElementById(id); };
       const jobLink = $('jobLink'), jobImdb = $('jobImdb'), jobSeason = $('jobSeason'), jobEpisode = $('jobEpisode');
+      const jobKind = $('jobKind'), jobKindNote = $('jobKindNote'), jobModelBox = $('jobModelBox'), jobReduceBox = $('jobReduceBox'), jobEpNote = $('jobEpNote'), jobBtnText = $('jobBtnText');
       const jobModel = $('jobModel'), jobReduce = $('jobReduce'), jobRecent = $('jobRecent'), jobBtn = $('jobBtn'), jobStatus = $('jobStatus'), jobList = $('jobList'), jobWorker = $('jobWorker');
       if (!jobBtn) return;
-      let timer = null, recent = [];
+      let timer = null, recent = [], exMode = 'translate';
+
+      function applyKind() {
+        const ex = jobKind.value === 'extract';
+        jobModelBox.style.display = ex ? 'none' : ''; jobReduceBox.style.display = ex ? 'none' : '';
+        jobBtnText.textContent = ex ? 'Look for subtitle tracks' : 'Send to my PC';
+        jobEpNote.textContent = ex ? 'Leave season and episode empty for a movie.' : 'Leave season and episode empty for a movie. The audio is assumed to be English.';
+        jobKindNote.textContent = ex ? 'Your PC lists the subtitle tracks inside the video and you pick one here. It needs the newest helper (run install.sh again). It has to read the whole file from the link, so big files take a while. Picture-based tracks (Blu-ray style) cannot be extracted.' : '';
+      }
+      jobKind.addEventListener('change', applyKind); applyKind();
 
       function msg(text, bad) { jobStatus.textContent = text; jobStatus.style.color = bad ? 'var(--err)' : 'var(--muted)'; }
       async function call(path, opts) {
@@ -1021,7 +1041,7 @@
         return s < 60 ? s + ' sec' : s < 3600 ? Math.round(s / 60) + ' min' : Math.round(s / 3600) + ' h';
       }
       function label(j) {
-        return j.imdb + (j.season ? ' S' + String(j.season).padStart(2, '0') + 'E' + String(j.episode).padStart(2, '0') : ' (movie)') + (j.host ? ' \u00B7 ' + j.host : '') + (j.model ? ' \u00B7 ' + j.model : '');
+        return (j.kind === 'extract' ? '\uD83D\uDCDD ' : '') + j.imdb + (j.season ? ' S' + String(j.season).padStart(2, '0') + 'E' + String(j.episode).padStart(2, '0') : ' (movie)') + (j.host ? ' \u00B7 ' + j.host : '') + (j.kind !== 'extract' && j.model ? ' \u00B7 ' + j.model : '');
       }
 
       async function loadRecent() {
@@ -1048,10 +1068,38 @@
 
       function describe(j, workerOnline) {
         if (j.status === 'queued') return [workerOnline ? '\u23F3 Waiting for your PC to pick it up...' : '\u23F3 Waiting. The helper is not running: open "AISUBS helper" on your PC.', ''];
+        if (j.status === 'choose') return ['\uD83D\uDC47 Choose the subtitle track to extract:', ''];
         if (j.status === 'working') return ['\u2699\uFE0F ' + (j.message || 'Working...'), ''];
-        if (j.status === 'done') return ['\u2705 ' + (j.message || 'Done.') + ' It is pinned at the top in Nuvio and translates when you play it.', 'ok'];
+        if (j.status === 'done') return ['\u2705 ' + (j.message || 'Done.') + ' It is pinned at the top in Nuvio' + (j.kind === 'extract' ? '.' : ' and translates when you play it.'), 'ok'];
         if (j.status === 'failed') return ['\u274C ' + (j.message || 'It failed.'), 'bad'];
         return ['Cancelled.', ''];
+      }
+
+      // The list of subtitle tracks your PC found inside the video, with a button per text track.
+      function trackPicker(j) {
+        const box = document.createElement('div'); box.style.margin = '0.5rem 0';
+        const modeLab = document.createElement('div'); modeLab.className = 'helper'; modeLab.textContent = 'After extracting:';
+        const wrap = document.createElement('div'); wrap.className = 'select-wrapper';
+        const sel = document.createElement('select');
+        [['translate', 'Translate it to Dutch when I play it'], ['native', 'Use it as it is (it is already Dutch)']].forEach(function (o) {
+          const op = document.createElement('option'); op.value = o[0]; op.textContent = o[1]; sel.appendChild(op);
+        });
+        sel.value = exMode; sel.addEventListener('change', function () { exMode = sel.value; });
+        wrap.appendChild(sel); box.appendChild(modeLab); box.appendChild(wrap);
+        (j.tracks || []).forEach(function (t) {
+          const b = document.createElement('button'); b.type = 'button'; b.className = 'btn btn-secondary btn-sm'; b.style.cssText = 'display:block;width:100%;text-align:left;margin-top:0.4rem;';
+          const name = (t.lang || '??') + ' \u00B7 ' + (t.codec || '?') + (t.title ? ' \u00B7 ' + t.title : '');
+          b.textContent = t.text ? name : name + ' (picture-based: cannot extract)';
+          b.disabled = !t.text;
+          b.addEventListener('click', async function () {
+            box.querySelectorAll('button').forEach(function (x) { x.disabled = true; });
+            try { await call('/api/jobs/' + j.id + '/choose', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ track: t.n, mode: exMode }) }); }
+            catch (err) { msg(err.message, true); }
+            refresh();
+          });
+          box.appendChild(b);
+        });
+        return box;
       }
 
       async function refresh() {
@@ -1073,9 +1121,10 @@
           const st = document.createElement('div'); st.className = 'up-meta'; st.textContent = d[0];
           if (d[1] === 'ok') st.style.color = 'var(--ok)'; else if (d[1] === 'bad') st.style.color = 'var(--err)';
           row.appendChild(st);
+          if (j.status === 'choose') row.appendChild(trackPicker(j));
           const act = document.createElement('div'); act.className = 'up-actions';
           const del = document.createElement('button'); del.type = 'button'; del.className = 'btn btn-secondary btn-sm btn-danger';
-          del.textContent = (j.status === 'queued' || j.status === 'working') ? 'Cancel' : 'Remove';
+          del.textContent = (j.status === 'queued' || j.status === 'working' || j.status === 'choose') ? 'Cancel' : 'Remove';
           del.addEventListener('click', async function () {
             del.disabled = true;
             try { await call('/api/jobs/' + j.id, { method: 'DELETE' }); } catch (e) { msg(e.message, true); }
@@ -1083,7 +1132,7 @@
           });
           act.appendChild(del); row.appendChild(act);
           jobList.appendChild(row);
-          if (j.status === 'queued' || j.status === 'working') busy = true;
+          if (j.status === 'queued' || j.status === 'working' || j.status === 'choose') busy = true;
         });
         if (busy) timer = setTimeout(refresh, 4000);
       }
@@ -1097,9 +1146,9 @@
         jobBtn.disabled = true; msg('Sending...');
         try {
           await call('/api/jobs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ link: link, imdb: jobImdb.value.trim(), season: s, episode: e, model: jobModel.value, reduce: !!jobReduce.checked }) });
+            body: JSON.stringify({ link: link, imdb: jobImdb.value.trim(), season: s, episode: e, model: jobModel.value, reduce: !!jobReduce.checked, kind: jobKind.value }) });
           jobLink.value = '';
-          msg('Queued. Your PC picks it up within a few seconds if the helper is running.');
+          msg(jobKind.value === 'extract' ? 'Queued. Your PC reads the track list first; it will appear below for you to choose from.' : 'Queued. Your PC picks it up within a few seconds if the helper is running.');
         } catch (err) { msg(err.message, true); }
         jobBtn.disabled = false;
         refresh();

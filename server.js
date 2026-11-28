@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { getManifest } from './manifest.js';
 
-const BUILD = '2026-11-28-model';   // shown in the log and on the status page, to confirm which version is deployed
+const BUILD = '2026-11-29-extract';   // shown in the log and on the status page, to confirm which version is deployed
 console.log(`[AISUBS] Build ${BUILD}`);
 const app = express();
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
@@ -298,7 +298,7 @@ let workerSeenAt = 0;                          // when the PC helper last asked 
 
 function sweepJobs(now = Date.now()) {
   for (const [id, j] of jobs) {
-    if (j.status === 'working' && now - j.updatedAt > JOB_STALE_MS) {
+    if ((j.status === 'working' || j.status === 'choose') && now - j.updatedAt > JOB_STALE_MS) {
       j.status = 'failed'; j.message = 'The PC helper stopped responding.'; j.updatedAt = now;
     }
     if (j.status === 'queued' && now - j.createdAt > JOB_QUEUE_EXPIRY_MS) jobs.delete(id);
@@ -306,8 +306,19 @@ function sweepJobs(now = Date.now()) {
 }
 function cleanJobText(t) { return String(t || '').replace(/https?:\/\/\S+/gi, '[link]').replace(/[\r\n]+/g, ' ').trim().slice(0, 200); }
 function jobHost(link) { try { return new URL(link).hostname; } catch (e) { return ''; } }   // the page never gets the full link back
+// What the helper says it found in the video (extract jobs). Only plain, short, whitelisted fields are kept.
+function cleanTracks(t) {
+  return (Array.isArray(t) ? t : []).slice(0, 40).map(x => ({
+    n: Number.isInteger(x?.n) && x.n >= 0 && x.n < 100 ? x.n : null,
+    codec: String(x?.codec || '').replace(/[^\w.-]/g, '').slice(0, 20),
+    lang: String(x?.lang || '').replace(/[^\w-]/g, '').slice(0, 12),
+    title: cleanJobText(x?.title).slice(0, 80),
+    text: x?.text === true,
+  })).filter(x => x.n !== null);
+}
 function jobView(j) {
-  return { id: j.id, status: j.status, message: j.message, imdb: j.imdb, season: j.season, episode: j.episode,
+  return { id: j.id, kind: j.kind || 'transcribe', tracks: j.status === 'choose' ? (j.tracks || []) : undefined,
+    status: j.status, message: j.message, imdb: j.imdb, season: j.season, episode: j.episode,
     host: jobHost(j.link), model: j.model || null, reduce: j.reduce !== false, createdAt: j.createdAt, updatedAt: j.updatedAt, cues: j.cues || null };
 }
 
@@ -315,6 +326,7 @@ app.post('/api/jobs', (req, res) => {
   const { link, imdb, season, episode } = req.body || {};
   const model = JOB_MODELS.includes(String(req.body?.model || '')) ? String(req.body.model) : null;   // null = the helper's own choice
   const reduce = req.body?.reduce !== false;
+  const kind = req.body?.kind === 'extract' ? 'extract' : 'transcribe';
   const url = String(link || '').trim();
   if (!/^https?:\/\/[^\s]{4,2000}$/i.test(url) || !jobHost(url)) return res.status(400).json({ error: 'Paste a direct link that starts with https://' });
   const tt = String(imdb || '').trim().toLowerCase();
@@ -331,10 +343,10 @@ app.post('/api/jobs', (req, res) => {
     jobs.delete(old.id);
   }
   const now = Date.now();
-  const j = { id: crypto.randomBytes(6).toString('hex'), link: url, imdb: tt, season: S, episode: E, model, reduce,
+  const j = { id: crypto.randomBytes(6).toString('hex'), link: url, imdb: tt, season: S, episode: E, model, reduce, kind, tracks: null, choice: null,
     status: 'queued', message: '', createdAt: now, updatedAt: now, cancelled: false, cues: null };
   jobs.set(j.id, j);
-  console.log(`[AISUBS] Transcription job queued for ${tt}${S ? ` S${S}E${E}` : ''} (${jobHost(url)}).`);   // never log the link itself
+  console.log(`[AISUBS] ${kind === 'extract' ? 'Subtitle extraction' : 'Transcription'} job queued for ${tt}${S ? ` S${S}E${E}` : ''} (${jobHost(url)}).`);   // never log the link itself
   res.json({ id: j.id });
 });
 
@@ -350,11 +362,13 @@ app.post('/api/jobs/claim', (req, res) => {
   sweepJobs();
   res.setHeader('Cache-Control', 'no-store');
   const all = [...jobs.values()];
-  if (all.some(j => j.status === 'working')) return res.json({ job: null });
-  const j = all.find(x => x.status === 'queued');          // oldest first (Map keeps insertion order)
+  if (all.some(j => j.status === 'working' || j.status === 'choose')) return res.json({ job: null });
+  // an older helper does not say it can extract: it never gets an extract job (it would transcribe it instead)
+  const canExtract = Array.isArray(req.body?.caps) && req.body.caps.includes('extract');
+  const j = all.find(x => x.status === 'queued' && (x.kind !== 'extract' || canExtract));   // oldest first (Map keeps insertion order)
   if (!j) return res.json({ job: null });
   j.status = 'working'; j.message = 'Picked up by your PC.'; j.updatedAt = Date.now();
-  res.json({ job: { id: j.id, link: j.link, imdb: j.imdb, season: j.season, episode: j.episode, model: j.model || null, reduce: j.reduce !== false } });
+  res.json({ job: { id: j.id, kind: j.kind || 'transcribe', link: j.link, imdb: j.imdb, season: j.season, episode: j.episode, model: j.model || null, reduce: j.reduce !== false } });
 });
 
 app.post('/api/jobs/:id/progress', (req, res) => {
@@ -362,18 +376,38 @@ app.post('/api/jobs/:id/progress', (req, res) => {
   const j = jobs.get(req.params.id);
   if (!j) return res.status(404).json({ error: 'No such job.' });
   if (j.cancelled) return res.json({ cancelled: true });
-  if (j.status !== 'working') return res.json({ ok: true });
-  const { status, message, cues } = req.body || {};
-  if (!['working', 'done', 'failed'].includes(status)) return res.status(400).json({ error: 'Bad status.' });
-  j.status = status; j.message = cleanJobText(message) || j.message; j.updatedAt = Date.now();
+  if (j.status !== 'working' && j.status !== 'choose') return res.json({ ok: true });
+  const { status, message, cues, tracks } = req.body || {};
+  if (!['working', 'choose', 'done', 'failed'].includes(status)) return res.status(400).json({ error: 'Bad status.' });
+  if (status === 'choose' && j.kind !== 'extract') return res.status(400).json({ error: 'Bad status.' });
+  j.updatedAt = Date.now();
+  if (status === 'choose' || (status === 'working' && j.status === 'choose' && !j.choice)) {
+    // waiting for you to pick a track: a late "choose" must never undo a pick that was just made
+    if (!j.choice) { j.status = 'choose'; j.message = cleanJobText(message) || j.message; if (tracks) j.tracks = cleanTracks(tracks); }
+    return res.json({ ok: true, choice: j.choice || null });
+  }
+  j.status = status; j.message = cleanJobText(message) || j.message;
   if (status === 'done' && Number.isFinite(Number(cues))) j.cues = Number(cues);
+  res.json({ ok: true, choice: j.choice || null });
+});
+
+// You tap a track on the page: the helper (still waiting) hears about it on its next check-in.
+app.post('/api/jobs/:id/choose', (req, res) => {
+  const j = jobs.get(req.params.id);
+  if (!j || j.kind !== 'extract' || j.status !== 'choose') return res.status(400).json({ error: 'This job is not waiting for a choice any more.' });
+  const n = Number(req.body?.track);
+  const t = (j.tracks || []).find(x => x.n === n);
+  if (!t || !t.text) return res.status(400).json({ error: 'Pick one of the text tracks in the list.' });
+  const mode = req.body?.mode === 'native' ? 'native' : 'translate';
+  j.choice = { track: n, mode };
+  j.status = 'working'; j.message = 'Track chosen. Your PC is extracting it...'; j.updatedAt = Date.now();
   res.json({ ok: true });
 });
 
 app.delete('/api/jobs/:id', (req, res) => {
   const j = jobs.get(req.params.id);
   if (!j) return res.json({ ok: true });
-  if (j.status === 'working') { j.cancelled = true; j.status = 'cancelled'; j.message = 'Cancelled.'; j.updatedAt = Date.now(); }   // the helper notices and stops
+  if (j.status === 'working' || j.status === 'choose') { j.cancelled = true; j.status = 'cancelled'; j.message = 'Cancelled.'; j.updatedAt = Date.now(); }   // the helper notices and stops
   else jobs.delete(j.id);
   res.json({ ok: true });
 });
