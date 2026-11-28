@@ -1068,7 +1068,7 @@
 
       function describe(j, workerOnline) {
         if (j.status === 'queued') return [workerOnline ? '\u23F3 Waiting for your PC to pick it up...' : '\u23F3 Waiting. The helper is not running: open "AISUBS helper" on your PC.', ''];
-        if (j.status === 'choose') return ['\uD83D\uDC47 Choose the subtitle track to extract:', ''];
+        if (j.status === 'choose') return ['\uD83D\uDC47 Tap the subtitle track you want:', ''];
         if (j.status === 'working') return ['\u2699\uFE0F ' + (j.message || 'Working...'), ''];
         if (j.status === 'done') return ['\u2705 ' + (j.message || 'Done.') + ' It is pinned at the top in Nuvio' + (j.kind === 'extract' ? '.' : ' and translates when you play it.'), 'ok'];
         if (j.status === 'failed') return ['\u274C ' + (j.message || 'It failed.'), 'bad'];
@@ -1087,9 +1087,14 @@
         sel.value = exMode; sel.addEventListener('change', function () { exMode = sel.value; });
         wrap.appendChild(sel); box.appendChild(modeLab); box.appendChild(wrap);
         (j.tracks || []).forEach(function (t) {
-          const b = document.createElement('button'); b.type = 'button'; b.className = 'btn btn-secondary btn-sm'; b.style.cssText = 'display:block;width:100%;text-align:left;margin-top:0.4rem;';
-          const name = (t.lang || '??') + ' \u00B7 ' + (t.codec || '?') + (t.title ? ' \u00B7 ' + t.title : '');
-          b.textContent = t.text ? name : name + ' (picture-based: cannot extract)';
+          const b = document.createElement('button'); b.type = 'button';
+          b.className = t.text ? 'btn btn-primary btn-sm' : 'btn btn-secondary btn-sm';
+          b.style.cssText = 'display:block;width:100%;text-align:center;margin-top:0.5rem;padding:0.75rem 1rem;';
+          const LANGS = { eng: 'English', dut: 'Dutch', nld: 'Dutch', fre: 'French', fra: 'French', ger: 'German', deu: 'German', spa: 'Spanish', ita: 'Italian', por: 'Portuguese',
+            jpn: 'Japanese', kor: 'Korean', chi: 'Chinese', zho: 'Chinese', rus: 'Russian', ara: 'Arabic', tur: 'Turkish', pol: 'Polish', swe: 'Swedish', nor: 'Norwegian', dan: 'Danish', fin: 'Finnish' };
+          const lang = LANGS[(t.lang || '').toLowerCase()] || t.lang || 'Unknown language';
+          const name = lang + ' \u00B7 ' + (t.codec || '?').toUpperCase() + (t.title ? ' \u00B7 ' + t.title : '');
+          b.textContent = t.text ? '\u2B07\uFE0F Extract: ' + name : name + ' (picture-based, cannot extract)';
           b.disabled = !t.text;
           b.addEventListener('click', async function () {
             box.querySelectorAll('button').forEach(function (x) { x.disabled = true; });
